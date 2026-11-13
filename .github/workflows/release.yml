@@ -1,0 +1,113 @@
+# Publishes the image to ghcr.io/origincloudhq/mcp-server:
+#
+# - every push to main, such as a merged update of the tools, as `main` and
+#   `sha-<commit>`, so that a method added to the API reaches an image
+#   without anyone's hand;
+# - every version tag (v1.2.3) as `1.2.3`, `1.2`, and `latest` for a release
+#   that isn't a prerelease, with a GitHub release naming the image's
+#   digest. RELEASING.md says how to make one.
+#
+# The tests run first; the image is built for linux/amd64, where it is
+# deployed.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: 'actions/checkout@v4'
+
+      - name: Rust
+        run: rustup toolchain install
+
+      - name: Cache
+        uses: 'Swatinem/rust-cache@v2'
+
+      - name: Tests
+        run: cargo test --locked
+
+      # A tag must name the version Cargo.toml has, which `--version`
+      # reports and the metrics' build info carries.
+      - name: Version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(sed -nE 's/^version = "(.*)"$/\1/p' Cargo.toml | head -1)"
+          if [[ "${TAG}" != "v${version}" ]]; then
+            echo "::error::the tag ${TAG} isn't Cargo.toml's version v${version}"
+            exit 1
+          fi
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+          flavor: |
+            latest=auto
+
+      - name: Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      # The tag and the digest reach the shell through the environment,
+      # never interpolated into the script.
+      - name: GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          prerelease=()
+          if [[ "${TAG}" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "${TAG}" --verify-tag "${prerelease[@]}" \
+            --title "${TAG}" \
+            --notes "Image: \`${IMAGE}:${VERSION}\` (\`${IMAGE}@${DIGEST}\`)" \
+            --generate-notes

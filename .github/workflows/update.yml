@@ -1,0 +1,174 @@
+# Keeps the server's tools current with the API: when origincloudhq/mcp's
+# main moves (its downstream workflow dispatches this one), daily as a
+# fallback, and when run by hand, scripts/update.sh moves the tools to the
+# head of origincloudhq/mcp and the SDK to the commit those are built on.
+# When that changes anything, the result is one pull request from the branch
+# `update`, refreshed by each later run until it is merged; when it changes
+# nothing, an open one is closed.
+#
+# Commits someone adds to that pull request, such as a change to the server
+# a new library needs, are kept: a later run updates on top of them, with
+# main merged in, and never closes a pull request that has them. Merging
+# main resolves a conflict in Cargo.lock, which scripts/update.sh writes
+# again anyway; any other conflict fails the run until someone merges main
+# into the branch by hand.
+#
+# Once CI passes on the pull request, merge-update.yml merges it when it
+# holds only this workflow's commits, and release.yml publishes the image of
+# the merge. The server's own code doesn't change for a new method.
+#
+# With the regeneration App configured (the variable REGENERATE_APP_ID and
+# the secret REGENERATE_APP_PRIVATE_KEY), the branch is pushed and the pull
+# request opened with the App's token, so that CI runs on the pull request,
+# and its merge starts the release. Without it, the workflow token opens the
+# pull request, which starts no pull_request run, so this dispatches CI on
+# the branch; its result shows on the pull request's commit, and the pull
+# request is merged by hand. Opening it with the workflow token needs "Allow
+# GitHub Actions to create and approve pull requests" in the repository's
+# Actions settings.
+name: Update
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      BRANCH: update
+    steps:
+      - name: App token
+        id: app
+        if: vars.REGENERATE_APP_ID != ''
+        uses: 'actions/create-github-app-token@v2'
+        with:
+          app-id: ${{ vars.REGENERATE_APP_ID }}
+          private-key: ${{ secrets.REGENERATE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: 'actions/checkout@v4'
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token || github.token }}
+
+      # The open pull request's branch, when someone has added commits to
+      # it, with main merged in; main otherwise.
+      - name: Base
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          bot="$(git config user.email)"
+          base=main
+          lease=""
+          # Exit status 2: there is no such branch. Any other failure fails
+          # the run rather than passing for an absent branch.
+          found=0
+          git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null || found=$?
+          if [[ "${found}" -eq 0 ]]; then
+            git fetch --quiet origin "${BRANCH}"
+            lease="$(git rev-parse FETCH_HEAD)"
+            open="$(gh pr list --head "${BRANCH}" --base main --state open --json number,isCrossRepository --jq 'map(select(.isCrossRepository | not))[0].number // empty')"
+            # Committers too: an amended or rebased commit of the workflow's
+            # keeps it as the author.
+            added="$(git log --format='%ae%n%ce' origin/main..FETCH_HEAD | grep -cvxF "${bot}" || true)"
+            if [[ -n "${open}" && "${added}" -gt 0 ]]; then
+              git switch --quiet -C "${BRANCH}" FETCH_HEAD
+              if ! git merge --quiet --no-edit origin/main; then
+                if git diff --name-only --diff-filter=U | grep -qxF Cargo.lock; then
+                  git checkout --quiet --ours -- Cargo.lock && git add -- Cargo.lock
+                fi
+                conflicts="$(git diff --name-only --diff-filter=U | paste -sd ' ' -)"
+                if [[ -n "${conflicts}" ]]; then
+                  echo "::error::merging main into ${BRANCH} conflicts in ${conflicts}: merge main into it by hand and push"
+                  exit 1
+                fi
+                git commit --quiet --no-edit
+              fi
+              base=branch
+            fi
+          elif [[ "${found}" -ne 2 ]]; then
+            echo "::error::could not read origin's branches"
+            exit 1
+          fi
+          {
+            echo "BASE=${base}"
+            echo "LEASE=${lease}"
+          } >> "$GITHUB_ENV"
+
+      # rustup installs the toolchain rust-toolchain.toml names.
+      - name: Rust
+        run: rustup toolchain install
+
+      - name: Update
+        run: scripts/update.sh
+
+      - name: Pull request
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          WITH_APP: ${{ steps.app.outputs.token != '' }}
+        run: |
+          set -euo pipefail
+          open="$(gh pr list --head "${BRANCH}" --base main --state open --json number,isCrossRepository --jq 'map(select(.isCrossRepository | not))[0].number // empty')"
+          if [[ "${BASE}" == main && -z "$(git status --porcelain)" ]]; then
+            echo "already current"
+            # The branch goes only as the Base step found it, and its pull
+            # request closes with it; one pushed to meanwhile stays.
+            if [[ -n "${LEASE}" ]]; then
+              if git push --quiet --force-with-lease="${BRANCH}:${LEASE}" origin ":${BRANCH}"; then
+                if [[ -n "${open}" ]]; then
+                  gh pr comment "${open}" --body "main is current with the tools."
+                fi
+              else
+                echo "::warning::${BRANCH} changed during the run; left as it is"
+              fi
+            fi
+            exit 0
+          fi
+
+          mcp="$(grep -oE 'origincloudhq/mcp", rev = "[0-9a-f]{40}"' Cargo.toml | grep -oE '[0-9a-f]{40}')"
+          previous="$(git show origin/main:Cargo.toml | grep -oE 'origincloudhq/mcp", rev = "[0-9a-f]{40}"' | grep -oE '[0-9a-f]{40}')"
+          git switch --quiet -C "${BRANCH}"
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add --all
+            git commit --quiet -m "Update the tools to origincloudhq/mcp@${mcp:0:12}" \
+              -m "Tools: https://github.com/origincloudhq/mcp/compare/${previous}...${mcp}"
+          fi
+
+          # Unchanged since the last run: nothing to push or check again.
+          if [[ -n "${LEASE}" ]] && git diff --quiet "${LEASE}" HEAD; then
+            echo "pull request #${open:-?} is current"
+            exit 0
+          fi
+          # Replaces the branch only as this run found it: a commit pushed
+          # meanwhile fails the run instead of being lost.
+          git push --quiet --force-with-lease="${BRANCH}:${LEASE}" origin "${BRANCH}"
+
+          body="Moves the tools to [origincloudhq/mcp@${mcp:0:12}](https://github.com/origincloudhq/mcp/commit/${mcp}) ([changes](https://github.com/origincloudhq/mcp/compare/${previous}...${mcp})), and the SDK to the commit they are built on, by scripts/update.sh.
+
+          If CI fails, the library changed in a way the server must follow; change the server on this branch."
+          if [[ -n "${open}" ]]; then
+            gh pr edit "${open}" --body "${body}"
+          else
+            gh pr create --base main --head "${BRANCH}" \
+              --title "Update the tools to the latest API" --body "${body}"
+          fi
+          # The App's push starts CI on the pull request; the workflow
+          # token's doesn't.
+          if [[ "${WITH_APP}" != true ]]; then
+            gh workflow run ci.yml --ref "${BRANCH}"
+          fi

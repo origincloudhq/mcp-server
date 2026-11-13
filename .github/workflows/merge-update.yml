@@ -1,0 +1,71 @@
+# Merges the update pull request (update.yml) once CI passed on its head
+# commit, when every commit in it is the update workflow's: the API change
+# was reviewed where the API is defined, the tools where they are generated,
+# and CI checks the server with them. A pull request someone added commits
+# to waits for review and is merged by hand.
+#
+# It merges with the regeneration App's token (REGENERATE_APP_ID and
+# REGENERATE_APP_PRIVATE_KEY), because a merge with the workflow token would
+# start no workflow on main, and so no image; without the App it does
+# nothing.
+name: Merge update
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [update]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: merge-update
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    # Only CI that passed on this repository's own branch: a fork's pull
+    # request from a branch of the same name doesn't count.
+    if: >-
+      vars.REGENERATE_APP_ID != '' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: App token
+        id: app
+        uses: 'actions/create-github-app-token@v2'
+        with:
+          app-id: ${{ vars.REGENERATE_APP_ID }}
+          private-key: ${{ secrets.REGENERATE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: 'actions/checkout@v4'
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          HEAD: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          bot='41898282+github-actions[bot]@users.noreply.github.com'
+          pr="$(gh pr list --head update --base main --state open \
+            --json number,headRefOid,isCrossRepository \
+            --jq "map(select((.isCrossRepository | not) and .headRefOid == \"${HEAD}\"))[0].number // empty")"
+          if [[ -z "${pr}" ]]; then
+            echo "no open update pull request at ${HEAD:0:12}: a later push replaced it, or it is merged"
+            exit 0
+          fi
+          git fetch --quiet origin "${HEAD}"
+          # Committers too: an amended or rebased commit keeps the workflow
+          # as its author.
+          others="$(git log --format='%ae%n%ce' "origin/main..${HEAD}" | grep -cvxF "${bot}" || true)"
+          if [[ "${others}" -gt 0 ]]; then
+            echo "pull request #${pr} has commits of someone else's: it needs review"
+            exit 0
+          fi
+          gh pr merge "${pr}" --merge --match-head-commit "${HEAD}"

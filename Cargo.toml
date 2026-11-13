@@ -1,0 +1,48 @@
+[package]
+name = "origincloud-mcp-server"
+version = "0.1.0"
+description = "The hosted Origin Cloud MCP server: the tools of origincloudhq/mcp over Streamable HTTP, as an OAuth resource server."
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/origincloudhq/mcp-server"
+homepage = "https://origincloud.eu"
+publish = false
+
+[dependencies]
+# The MCP tools, at a commit of origincloudhq/mcp's main. The server has no
+# tools of its own: a method added to the API reaches it by moving this
+# commit (scripts/update.sh).
+origincloud-mcp = { git = "https://github.com/origincloudhq/mcp", rev = "2ddd372ee51b92901c865ecba260c4c8b5cbea24" }
+# The Rust SDK, at the commit the MCP tools above are built on: the server
+# hands the tools the SDK's `Client`, so both must be the same crate.
+# scripts/update.sh moves the two together, and scripts/check.sh fails when
+# they differ.
+origincloud-core = { git = "https://github.com/origincloudhq/sdk-rust", rev = "37d10062c771d17b86d9907f94380930a48e85ba" }
+
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+http = "1"
+jsonwebtoken = "9"
+prometheus = { version = "0.14", default-features = false }
+reqwest = { version = "0.13", features = ["json", "form", "rustls"] }
+rmcp = { version = "3", default-features = false, features = ["server", "transport-streamable-http-server"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio-util = "0.7"
+tower-http = { version = "0.6", features = ["cors", "request-id", "util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+base64 = "0.22"
+# The SDK's fake API, at the same commit as the SDK.
+fake-server = { git = "https://github.com/origincloudhq/sdk-rust", rev = "37d10062c771d17b86d9907f94380930a48e85ba" }
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rmcp = { version = "3", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
