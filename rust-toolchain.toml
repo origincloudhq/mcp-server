@@ -1,0 +1,5 @@
+# The Rust the server is built and checked with, in CI and locally.
+# Pinned so that a new compiler's lints don't turn main red on their own.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
