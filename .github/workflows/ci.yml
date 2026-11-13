@@ -1,0 +1,72 @@
+# Checks every pull request and every push to main: the SDK the server is
+# built on is the one its MCP tools are (scripts/check.sh), the code is
+# formatted and lint-free, the tests pass, among them the end-to-end ones
+# against a fake authorization server and a fake API, and the image builds.
+#
+# The update pull request is opened with the workflow token, which starts no
+# pull_request run, so update.yml dispatches this workflow on its branch
+# instead when it has no App token.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: 'actions/checkout@v4'
+
+      # rustup installs the toolchain rust-toolchain.toml names.
+      - name: Rust
+        run: rustup toolchain install
+
+      - name: Cache
+        uses: 'Swatinem/rust-cache@v2'
+
+      - name: The SDK the tools are built on
+        run: scripts/check.sh
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Scripts
+        run: shellcheck scripts/*.sh
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: 'actions/checkout@v4'
+
+      - name: Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
