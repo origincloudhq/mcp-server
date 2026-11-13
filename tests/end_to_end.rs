@@ -83,6 +83,110 @@ async fn a_token_issued_for_another_audience_is_refused() {
     assert!(h.api.received().is_empty(), "nothing reaches the API");
 }
 
+/// A service account's token: Keycloak's client credentials grant, issued to
+/// the account's own client, with the claims that grant sets.
+#[tokio::test]
+async fn a_service_account_s_token_is_refused_before_any_exchange() {
+    let h = Harness::start(pvs).await;
+    let account = "sa-0b5e2c1a-7d4f-4e0a-9c3b-2f6d8e1a4b7c";
+    let token = h.issuer.token(json!({
+        "sub": "5f1c9e2a-3b7d-4c8e-a1f0-6d2b9e4c7a13",
+        "aud": [h.url.clone(), "origincloud-mcp-server"],
+        "azp": account,
+        "client_id": account,
+        "clientHost": "203.0.113.7",
+        "clientAddress": "203.0.113.7",
+        "scope": "mcp",
+    }));
+
+    let response = h.post("", Some(&format!("Bearer {token}"))).await;
+    assert_eq!(response.status(), 403);
+    let challenge = header(&response, "www-authenticate").to_owned();
+    assert!(challenge.starts_with("Bearer "), "{challenge}");
+    assert!(
+        challenge.contains("error=\"insufficient_scope\""),
+        "{challenge}"
+    );
+    assert!(
+        challenge.contains(&format!(
+            "resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+            h.url
+        )),
+        "{challenge}"
+    );
+    assert!(
+        !challenge.contains("scope=\"mcp\""),
+        "a scope no service account can use: {challenge}"
+    );
+    assert!(challenge.contains("origin mcp serve"), "{challenge}");
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "insufficient_scope");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("origin mcp serve"),
+        "{body}"
+    );
+
+    assert!(h.issuer.exchanges().is_empty(), "the token was exchanged");
+    assert!(h.api.received().is_empty(), "something reached the API");
+    let metrics = reqwest::get(format!("{}/metrics", h.metrics_url))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("origincloud_mcp_auth_refusals_total{reason=\"client\"}"),
+        "{metrics}"
+    );
+}
+
+/// A token for the server's audience issued to another client than the one
+/// people sign in to it with, or naming none, is refused the same way.
+#[tokio::test]
+async fn a_token_of_another_client_is_refused() {
+    let h = Harness::start(pvs).await;
+    let aud = json!([h.url.clone(), "origincloud-mcp-server"]);
+    let tokens = [
+        (
+            "another client's",
+            h.issuer
+                .token(json!({ "sub": "alice", "aud": aud, "azp": "origin-cli" })),
+        ),
+        (
+            "an empty client's",
+            h.issuer
+                .token(json!({ "sub": "alice", "aud": aud, "azp": "" })),
+        ),
+        ("a clientless", {
+            // The fake issuer's defaults name the login client; this names none.
+            let mut claims = common::claims(&h.token_for("alice"));
+            claims.as_object_mut().unwrap().remove("azp");
+            h.issuer.token_without_defaults(claims)
+        }),
+    ];
+    for (what, token) in tokens {
+        let response = h.post("", Some(&format!("Bearer {token}"))).await;
+        assert_eq!(response.status(), 403, "{what} token");
+        assert!(
+            header(&response, "www-authenticate").contains("insufficient_scope"),
+            "{what} token"
+        );
+    }
+    assert!(h.issuer.exchanges().is_empty());
+    assert!(h.api.received().is_empty());
+
+    // The login client's token still works.
+    let agent = h.connect(&h.token_for("alice"), "").await;
+    let read = agent
+        .call("pvs_get_volume", json!({ "name": VOLUME }))
+        .await;
+    assert_ne!(read.is_error, Some(true), "{read:?}");
+    assert_eq!(h.api.received().len(), 1);
+}
+
 #[tokio::test]
 async fn only_the_issuer_s_unexpired_tokens_are_accepted() {
     let h = Harness::start(pvs).await;

@@ -133,6 +133,13 @@ impl Issuer {
         self.sign(&self.key, claims)
     }
 
+    /// A token of exactly `claims`, without the defaults.
+    pub fn token_without_defaults(&self, claims: Value) -> String {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("key-1".to_owned());
+        jsonwebtoken::encode(&header, &claims, &self.key).expect("a token")
+    }
+
     /// The same, signed with a key the issuer doesn't publish.
     pub fn forged(&self, claims: Value) -> String {
         self.sign(&self.impostor, claims)
@@ -140,7 +147,7 @@ impl Issuer {
 
     fn sign(&self, key: &EncodingKey, mut claims: Value) -> String {
         let defaults =
-            json!({ "iss": self.id(), "iat": now(), "exp": now() + 300, "azp": "test-client" });
+            json!({ "iss": self.id(), "iat": now(), "exp": now() + 300, "azp": "origincloud-mcp" });
         for (k, v) in defaults.as_object().unwrap() {
             if claims.get(k).is_none() {
                 claims[k] = v.clone();
