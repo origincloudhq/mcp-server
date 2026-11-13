@@ -5,6 +5,9 @@
 //! - A request without a bearer token issued for this server is answered
 //!   `401` with a `WWW-Authenticate` challenge naming the protected resource
 //!   metadata (RFC 9728), which names the authorization server.
+//! - A valid token issued to another client than the one people sign in
+//!   with, such as a service account's, is answered `403`
+//!   (`insufficient_scope`) before it is exchanged.
 //! - A tool call reaches the API with a token exchanged for the caller's
 //!   (RFC 8693), never with the caller's own; see [`exchange`].
 //! - The connection's toolsets and read-only mode come from the URL's query;
@@ -78,7 +81,11 @@ impl Server {
             ))
             .build()?;
         let issuer = Arc::new(Issuer::new(config.issuer_id(), http.clone()));
-        let authenticator = Authenticator::new(Arc::clone(&issuer), config.accepted_audience());
+        let authenticator = Authenticator::new(
+            Arc::clone(&issuer),
+            config.accepted_audience(),
+            config.allowed_clients.clone(),
+        );
         let exchanger = Arc::new(Exchanger::new(
             http.clone(),
             Arc::clone(&issuer),
@@ -285,16 +292,17 @@ fn refuse(state: &Shared, refusal: Refusal) -> Response {
             response
         }
         refusal => {
-            if let Refusal::Invalid(reason) = &refusal {
+            if let Refusal::Invalid(reason) | Refusal::Client(reason) = &refusal {
                 tracing::info!(reason, "refused a token");
             }
             let challenge = auth::challenge(&config.metadata_url(), &config.scopes, &refusal);
-            let error = match refusal {
-                Refusal::Invalid(_) => "invalid_token",
-                _ => "unauthorized",
+            let (status, error) = match refusal {
+                Refusal::Invalid(_) => (StatusCode::UNAUTHORIZED, "invalid_token"),
+                Refusal::Client(_) => (StatusCode::FORBIDDEN, "insufficient_scope"),
+                _ => (StatusCode::UNAUTHORIZED, "unauthorized"),
             };
             let mut response = (
-                StatusCode::UNAUTHORIZED,
+                status,
                 Json(json!({ "error": error, "error_description": refusal.to_string() })),
             )
                 .into_response();

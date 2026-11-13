@@ -65,6 +65,11 @@ pub enum Refusal {
     /// The token isn't one the server accepts.
     #[error("{0}")]
     Invalid(String),
+    /// The token is valid, but was issued to a client the server doesn't
+    /// serve, such as a service account's: the server is for people who
+    /// sign in through an MCP client.
+    #[error("{0}")]
+    Client(String),
     /// The issuer's keys couldn't be read, so no token can be checked.
     #[error("the authorization server can't be reached: {0}")]
     Unavailable(#[source] IssuerError),
@@ -76,6 +81,7 @@ impl Refusal {
         match self {
             Self::Missing => "missing",
             Self::Invalid(_) => "invalid",
+            Self::Client(_) => "client",
             Self::Unavailable(_) => "unavailable",
         }
     }
@@ -91,15 +97,21 @@ struct Claims {
 }
 
 /// Checks access tokens: signed by the issuer with one of its keys, issued
-/// by it, for the server's audience, and in their lifetime.
+/// by it, for the server's audience, in their lifetime, and to one of the
+/// clients people sign in to the server with (`azp`).
 pub struct Authenticator {
     issuer: Arc<Issuer>,
     audience: String,
+    clients: Vec<String>,
 }
 
 impl Authenticator {
-    pub fn new(issuer: Arc<Issuer>, audience: String) -> Self {
-        Self { issuer, audience }
+    pub fn new(issuer: Arc<Issuer>, audience: String, clients: Vec<String>) -> Self {
+        Self {
+            issuer,
+            audience,
+            clients,
+        }
     }
 
     /// The caller of a request with `headers`.
@@ -139,7 +151,7 @@ impl Authenticator {
                 continue;
             };
             match jsonwebtoken::decode::<Claims>(token, &decoding, &validation) {
-                Ok(data) => return caller(token, data.claims),
+                Ok(data) => return self.caller(token, data.claims),
                 Err(error) => refused = Some(error),
             }
         }
@@ -193,18 +205,36 @@ fn usable(key: &Jwk, alg: Algorithm) -> bool {
     )
 }
 
-fn caller(token: &str, claims: Claims) -> Result<Caller, Refusal> {
-    let subject = claims
-        .sub
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Refusal::Invalid("the token has no subject".to_owned()))?;
-    Ok(Caller {
-        subject,
-        client: claims.azp,
-        token: Arc::from(token),
-        expires_at: UNIX_EPOCH + Duration::from_secs(claims.exp),
-    })
+impl Authenticator {
+    /// The caller of a verified token, if it was issued to a client people
+    /// sign in with. A service account's token is issued to the account's
+    /// own client, so it is refused here, before it is ever exchanged.
+    fn caller(&self, token: &str, claims: Claims) -> Result<Caller, Refusal> {
+        let subject = claims
+            .sub
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Refusal::Invalid("the token has no subject".to_owned()))?;
+        let client = claims.azp.filter(|c| !c.is_empty());
+        if !client
+            .as_deref()
+            .is_some_and(|c| self.clients.iter().any(|allowed| allowed == c))
+        {
+            return Err(Refusal::Client(NOT_FOR_THIS_CLIENT.to_owned()));
+        }
+        Ok(Caller {
+            subject,
+            client,
+            token: Arc::from(token),
+            expires_at: UNIX_EPOCH + Duration::from_secs(claims.exp),
+        })
+    }
 }
+
+/// Why a token issued to another client, such as a service account's, is
+/// refused, and what to do instead.
+pub const NOT_FOR_THIS_CLIENT: &str = "the hosted MCP server is for people who sign in \
+    through their MCP client; a service account runs `origin mcp serve` with its own \
+    credentials instead";
 
 /// What a client is told about a token the server refused.
 fn describe(error: &jsonwebtoken::errors::Error, audience: &str) -> String {
@@ -226,8 +256,22 @@ fn describe(error: &jsonwebtoken::errors::Error, audience: &str) -> String {
 /// 3; RFC 9728, section 5.1): where the protected resource metadata is, the
 /// scopes to request, and, for a token that was presented, why it was
 /// refused.
+///
+/// A token of another client is valid, so it isn't `invalid_token`; the
+/// request needs privileges that token doesn't carry, which RFC 6750 calls
+/// `insufficient_scope` and answers with 403. No `scope` is named: no scope
+/// a service account could request makes its token acceptable, and a
+/// client stepping up would only ask for the same token again.
 pub fn challenge(metadata_url: &str, scopes: &[String], refusal: &Refusal) -> String {
     let mut params = vec![format!("resource_metadata=\"{metadata_url}\"")];
+    if let Refusal::Client(description) = refusal {
+        params.push("error=\"insufficient_scope\"".to_owned());
+        params.push(format!(
+            "error_description=\"{}\"",
+            description.replace(['"', '\\'], "'")
+        ));
+        return format!("Bearer {}", params.join(", "));
+    }
     let scopes: Vec<&str> = scopes
         .iter()
         .map(String::as_str)
@@ -278,6 +322,18 @@ mod tests {
             c,
             "Bearer resource_metadata=\"https://m/.well-known/oauth-protected-resource\", error=\"invalid_token\", error_description=\"the token wasn't issued for 'x'\""
         );
+    }
+
+    #[test]
+    fn another_client_s_token_is_challenged_for_insufficient_scope_without_a_scope() {
+        let c = challenge(
+            "https://m/.well-known/oauth-protected-resource",
+            &["mcp".to_owned()],
+            &Refusal::Client(NOT_FOR_THIS_CLIENT.to_owned()),
+        );
+        assert!(c.starts_with("Bearer resource_metadata=\"https://m/.well-known/oauth-protected-resource\", error=\"insufficient_scope\", error_description=\""), "{c}");
+        assert!(!c.contains("scope=\"mcp\""), "{c}");
+        assert!(c.contains("`origin mcp serve`"), "{c}");
     }
 
     #[test]

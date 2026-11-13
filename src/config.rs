@@ -62,6 +62,17 @@ pub struct Config {
     #[arg(long, env = "MCP_SCOPES", default_value = "mcp", value_delimiter = ' ')]
     pub scopes: Vec<String>,
 
+    /// The clients people sign in to the server with: a token must have been
+    /// issued to one of them (`azp`). Any other token, such as a service
+    /// account's, is refused before it is exchanged; comma-separated.
+    #[arg(
+        long,
+        env = "MCP_ALLOWED_CLIENTS",
+        default_value = "origincloud-mcp",
+        value_delimiter = ','
+    )]
+    pub allowed_clients: Vec<String>,
+
     /// The confidential client the server exchanges callers' tokens as.
     #[arg(
         long,
@@ -155,6 +166,8 @@ pub enum ConfigError {
     Issuer(String),
     #[error("the exchange client's secret is empty")]
     EmptySecret,
+    #[error("no client is allowed: name at least one in --allowed-clients")]
+    NoClient,
 }
 
 impl Config {
@@ -174,6 +187,9 @@ impl Config {
         }
         if self.exchange_client_secret.expose().is_empty() {
             return Err(ConfigError::EmptySecret);
+        }
+        if !self.allowed_clients.iter().any(|c| !c.trim().is_empty()) {
+            return Err(ConfigError::NoClient);
         }
         Ok(())
     }
@@ -278,6 +294,7 @@ mod tests {
             "https://auth.origincloud.eu/realms/origincloud"
         );
         assert_eq!(c.scopes, ["mcp"]);
+        assert_eq!(c.allowed_clients, ["origincloud-mcp"]);
         assert_eq!(c.hosts(), ["mcp.origincloudapis.eu"]);
     }
 

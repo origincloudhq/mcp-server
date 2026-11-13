@@ -59,15 +59,24 @@ requires:
    issuer's JWKS (fetched from its OpenID configuration, kept for ten
    minutes, fetched again for a key it doesn't know), issued by the issuer,
    for the server's own audience, and in its lifetime.
-4. A tool call reaches the API with an access token the server obtains by
+4. The token must also have been issued to the client people sign in to
+   the server with, `origincloud-mcp` (its `azp`). Any other valid token,
+   such as a service account's, is answered `403` with
+   `WWW-Authenticate: Bearer error="insufficient_scope"`, before it is ever
+   exchanged: the token is valid, but doesn't carry what this server needs
+   (RFC 6750, section 3.1). No `scope` is named, since no scope a service
+   account could request would make its token acceptable.
+5. A tool call reaches the API with an access token the server obtains by
    token exchange (RFC 8693) at the issuer: the caller's token as the
    subject, the server's own confidential client as the requester, the
    API's audience as the target. The exchanged token is kept until shortly
    before it expires, and never past the caller's token. The caller's token
    is never sent anywhere but to the issuer.
 
-A service account's access token works the same way, for agents without a
-browser, as long as it was issued for the server's audience.
+The hosted server is for people signing in through their MCP client. An
+agent running as a service account runs `origin mcp serve` of the
+[`origin` CLI](https://github.com/origincloudhq/cli) with the account's own
+credentials instead, which serves the same tools on its machine.
 
 The server keeps no MCP sessions: each request is answered on its own, so
 that any replica can answer any request. Each caller's SDK client is kept
@@ -90,6 +99,7 @@ them. The defaults are Origin Cloud's production values.
 | `--audience` | `MCP_AUDIENCE` | the canonical URI | The audience a token must carry |
 | `--issuer` | `MCP_ISSUER` | `https://auth.origincloud.eu/realms/origincloud` | The authorization server |
 | `--scopes` | `MCP_SCOPES` | `mcp` | The scopes a client requests, space-separated |
+| `--allowed-clients` | `MCP_ALLOWED_CLIENTS` | `origincloud-mcp` | The clients a token must have been issued to, comma-separated |
 | `--exchange-client-id` | `MCP_EXCHANGE_CLIENT_ID` | `origincloud-mcp-server` | The client the server exchanges tokens as |
 | `--exchange-client-secret` | `MCP_EXCHANGE_CLIENT_SECRET` | none, required | Its secret |
 | `--api-audience` | `MCP_API_AUDIENCE` | `account` | The audience of an exchanged token |
@@ -112,7 +122,8 @@ and run as a user without privileges.
   `origincloud_http_requests_total`, `origincloud_http_request_duration_seconds`,
   `origincloud_http_requests_in_flight`, `origincloud_mcp_tool_calls_total{tool,outcome}`,
   `origincloud_mcp_token_exchanges_total{outcome}`,
-  `origincloud_mcp_auth_refusals_total{reason}` and `origincloud_build_info`.
+  `origincloud_mcp_auth_refusals_total{reason}` (`missing`, `invalid`, `client`,
+  `unavailable`) and `origincloud_build_info`.
 - **Health:** `/healthz` answers while the process runs; `/readyz` once the
   issuer's configuration has been read, and until a termination signal.
 

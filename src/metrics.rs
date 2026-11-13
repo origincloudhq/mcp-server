@@ -13,8 +13,9 @@
 //! - `origincloud_mcp_token_exchanges_total{outcome}`: `exchanged`,
 //!   `cached` (a token exchanged before was used) or `failed`.
 //! - `origincloud_mcp_auth_refusals_total{reason}`: requests refused for
-//!   their token: `missing`, `invalid` or `unavailable` (the issuer's keys
-//!   couldn't be read).
+//!   their token: `missing`, `invalid`, `client` (a valid token issued to a
+//!   client the server doesn't serve, such as a service account's) or
+//!   `unavailable` (the issuer's keys couldn't be read).
 //! - `origincloud_build_info{artifact,version}`: 1.
 
 use std::sync::OnceLock;
