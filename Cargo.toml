@@ -12,7 +12,7 @@ publish = false
 # The MCP tools, at a commit of origincloudhq/mcp's main. The server has no
 # tools of its own: a method added to the API reaches it by moving this
 # commit (scripts/update.sh).
-origincloud-mcp = { git = "https://github.com/origincloudhq/mcp", rev = "2ddd372ee51b92901c865ecba260c4c8b5cbea24" }
+origincloud-mcp = { git = "https://github.com/origincloudhq/mcp", rev = "a3d419df4bdc55cc1c3a187bf5e02e851c783fde" }
 # The Rust SDK, at the commit the MCP tools above are built on: the server
 # hands the tools the SDK's `Client`, so both must be the same crate.
 # scripts/update.sh moves the two together, and scripts/check.sh fails when
