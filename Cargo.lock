@@ -1440,7 +1440,7 @@ dependencies = [
 [[package]]
 name = "origincloud-mcp"
 version = "0.1.0"
-source = "git+https://github.com/origincloudhq/mcp?rev=2ddd372ee51b92901c865ecba260c4c8b5cbea24#2ddd372ee51b92901c865ecba260c4c8b5cbea24"
+source = "git+https://github.com/origincloudhq/mcp?rev=a3d419df4bdc55cc1c3a187bf5e02e851c783fde#a3d419df4bdc55cc1c3a187bf5e02e851c783fde"
 dependencies = [
  "origincloud-billing",
  "origincloud-compute",
