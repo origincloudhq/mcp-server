@@ -24,8 +24,18 @@ use serde::Deserialize;
 
 pub use issuer::Issuer;
 
-/// How far the clocks of the issuer and the server may differ.
-const LEEWAY: Duration = Duration::from_secs(30);
+/// How far the clocks of the issuer and the server may differ: a token
+/// whose `nbf` is that far ahead is still taken. A token is never taken
+/// after its `exp`.
+pub const LEEWAY: Duration = Duration::from_secs(30);
+
+/// The furthest ahead a token's `exp` may be: an access token lives
+/// minutes, so a later one is no token of the issuers this server trusts.
+const MAX_LIFETIME: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// The longest token read: a realm's token with many roles is a few
+/// kilobytes.
+const MAX_TOKEN_BYTES: usize = 16 * 1024;
 
 /// The algorithms a token may be signed with: asymmetric ones only, so that
 /// the issuer's public keys can't verify a token signed with themselves.
@@ -60,6 +70,8 @@ pub enum Proof {
 pub struct Caller {
     /// The token's subject, `sub`, a user or a service account.
     pub subject: String,
+    /// Who issued the token: the realm, or a zone's STS.
+    pub issuer: String,
     /// The client the token was issued to, `azp`, such as an MCP client.
     /// A zone STS's tokens name none.
     pub client: Option<String>,
@@ -69,6 +81,8 @@ pub struct Caller {
     pub token: Arc<str>,
     /// When the token expires.
     pub expires_at: SystemTime,
+    /// When the token becomes valid, if it says.
+    pub not_before: Option<SystemTime>,
 }
 
 impl fmt::Debug for Caller {
@@ -118,6 +132,13 @@ struct Claims {
     sub: Option<String>,
     azp: Option<String>,
     exp: u64,
+    nbf: Option<u64>,
+    typ: Option<String>,
+    email: Option<String>,
+    email_verified: Option<bool>,
+    name: Option<String>,
+    given_name: Option<String>,
+    family_name: Option<String>,
 }
 
 /// An STS token's claims, read before its signature is checked, to refuse
@@ -128,6 +149,38 @@ struct StsClaims {
     aud: Option<Audience>,
     exp: Option<u64>,
     nbf: Option<u64>,
+}
+
+/// What a token's lifetime says, checked against `now` (seconds since the
+/// epoch): not expired, not further ahead than [`MAX_LIFETIME`], and not
+/// valid later than the leeway. `exp` isn't given leeway, so that a token
+/// this server takes is one the exchange won't find expired.
+fn lifetime(
+    exp: u64,
+    nbf: Option<u64>,
+    now: u64,
+) -> Result<(SystemTime, Option<SystemTime>), Refusal> {
+    if exp <= now {
+        return Err(Refusal::Invalid("the token has expired".to_owned()));
+    }
+    if exp - now > MAX_LIFETIME.as_secs() {
+        return Err(Refusal::Invalid(
+            "the token's expiry is further ahead than this server accepts".to_owned(),
+        ));
+    }
+    let not_yet = || Refusal::Invalid("the token isn't valid yet".to_owned());
+    if nbf.is_some_and(|nbf| nbf > now.saturating_add(LEEWAY.as_secs())) {
+        return Err(not_yet());
+    }
+    let at = |seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds));
+    let expires = at(exp).ok_or_else(not_yet)?;
+    Ok((expires, nbf.and_then(at)))
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// `aud` is a string or a list of them (RFC 7519, section 4.1.3).
@@ -175,6 +228,9 @@ impl Authenticator {
 
     /// The caller `token` names, if the server accepts it.
     pub async fn verify(&self, token: &str) -> Result<Caller, Refusal> {
+        if token.len() > MAX_TOKEN_BYTES {
+            return Err(Refusal::Invalid("the token is too long".to_owned()));
+        }
         let header = jsonwebtoken::decode_header(token)
             .map_err(|_| Refusal::Invalid("the token isn't a JWT".to_owned()))?;
         if !ALGORITHMS.contains(&header.alg) {
@@ -187,7 +243,14 @@ impl Authenticator {
         let issuer = unverified_issuer(token)
             .ok_or_else(|| Refusal::Invalid("the token isn't a JWT".to_owned()))?;
         if is_sts_issuer(&issuer) {
-            return self.sts_caller(token);
+            // The STS signs EdDSA and names its key: a token that doesn't
+            // is none of its, and isn't worth asking it about.
+            if header.alg != Algorithm::EdDSA || header.kid.as_deref().is_none_or(str::is_empty) {
+                return Err(Refusal::Invalid(
+                    "the token isn't signed as the STS signs its tokens".to_owned(),
+                ));
+            }
+            return self.sts_caller(token, issuer);
         }
         if issuer != self.issuer.id() {
             return Err(Refusal::Invalid(
@@ -290,26 +353,50 @@ fn usable(key: &Jwk, alg: Algorithm) -> bool {
 impl Authenticator {
     /// The caller of a realm's token, whose signature is checked, unless
     /// the server is restricted to some clients and the token isn't one's.
+    /// It must be a person's, as the STS requires: an access token of a
+    /// user, with the claims that say who.
     fn caller(&self, token: &str, claims: Claims) -> Result<Caller, Refusal> {
+        let (expires_at, not_before) = lifetime(claims.exp, claims.nbf, now_seconds())?;
         let subject = claims
             .sub
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Refusal::Invalid("the token has no subject".to_owned()))?;
         let client = claims.azp.filter(|c| !c.is_empty());
         self.allow_client(client.as_deref())?;
+        let not_a_person =
+            |why: &str| Refusal::Invalid(format!("the token isn't a person's access token: {why}"));
+        if claims.typ.as_deref().is_some_and(|typ| typ != "Bearer") {
+            return Err(not_a_person("its type isn't Bearer"));
+        }
+        if uuid::Uuid::parse_str(&subject).is_err() {
+            return Err(not_a_person("its subject isn't a user's id"));
+        }
+        let named = |claim: &Option<String>| claim.as_deref().is_some_and(|c| !c.is_empty());
+        if !(named(&claims.email)
+            && claims.email_verified.is_some()
+            && named(&claims.name)
+            && named(&claims.given_name)
+            && named(&claims.family_name))
+        {
+            return Err(not_a_person(
+                "it lacks the email, email_verified, name, given_name or family_name claim",
+            ));
+        }
         Ok(Caller {
             subject,
+            issuer: self.issuer.id().to_owned(),
             client,
             proof: Proof::Signature,
             token: Arc::from(token),
-            expires_at: UNIX_EPOCH + Duration::from_secs(claims.exp),
+            expires_at,
+            not_before,
         })
     }
 
     /// The caller of a zone STS's token, whose issuer, audience and
     /// lifetime are checked here and whose signature is the STS's to check
     /// ([`Proof::Exchange`]).
-    fn sts_caller(&self, token: &str) -> Result<Caller, Refusal> {
+    fn sts_caller(&self, token: &str, issuer: String) -> Result<Caller, Refusal> {
         let payload = token
             .split('.')
             .nth(1)
@@ -317,19 +404,10 @@ impl Authenticator {
             .ok_or_else(|| Refusal::Invalid("the token isn't a JWT".to_owned()))?;
         let claims: StsClaims = serde_json::from_slice(&payload)
             .map_err(|_| Refusal::Invalid("the token isn't a JWT".to_owned()))?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let leeway = LEEWAY.as_secs();
         let exp = claims
             .exp
             .ok_or_else(|| Refusal::Invalid("the token has no exp".to_owned()))?;
-        if exp + leeway <= now {
-            return Err(Refusal::Invalid("the token has expired".to_owned()));
-        }
-        if claims.nbf.is_some_and(|nbf| nbf > now + leeway) {
-            return Err(Refusal::Invalid("the token isn't valid yet".to_owned()));
-        }
+        let (expires_at, not_before) = lifetime(exp, claims.nbf, now_seconds())?;
         if !claims
             .aud
             .as_ref()
@@ -347,10 +425,12 @@ impl Authenticator {
         self.allow_client(None)?;
         Ok(Caller {
             subject,
+            issuer,
             client: None,
             proof: Proof::Exchange,
             token: Arc::from(token),
-            expires_at: UNIX_EPOCH + Duration::from_secs(exp),
+            expires_at,
+            not_before,
         })
     }
 

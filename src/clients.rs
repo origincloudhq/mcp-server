@@ -35,7 +35,7 @@ pub struct Registry {
     api: Api,
     exchanger: Arc<Exchanger>,
     http: reqwest::Client,
-    callers: Mutex<HashMap<String, Held>>,
+    callers: Mutex<HashMap<(String, String), Held>>,
 }
 
 struct Held {
@@ -58,7 +58,8 @@ impl Registry {
     pub fn client(&self, caller: &Caller) -> Result<Client, origincloud_core::Error> {
         let now = Instant::now();
         let mut callers = self.callers.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(held) = callers.get_mut(&caller.subject) {
+        let key = (caller.issuer.clone(), caller.subject.clone());
+        if let Some(held) = callers.get_mut(&key) {
             held.credentials.present(caller);
             held.used = now;
             return Ok(held.client.clone());
@@ -95,7 +96,7 @@ impl Registry {
             callers.remove(&idlest);
         }
         callers.insert(
-            caller.subject.clone(),
+            key,
             Held {
                 client: client.clone(),
                 credentials,
@@ -113,10 +114,15 @@ struct CallerCredentials {
 }
 
 impl CallerCredentials {
-    /// Presents `caller`'s token from now on: the latest the caller sent,
-    /// all of them the same subject's.
+    /// Presents `caller`'s token from now on, unless the one held lives
+    /// longer: a request that arrives late with an older token mustn't
+    /// replace the newer one. All of them are the same issuer's and
+    /// subject's.
     fn present(&self, caller: &Caller) {
-        *self.caller.lock().unwrap_or_else(|e| e.into_inner()) = caller.clone();
+        let mut held = self.caller.lock().unwrap_or_else(|e| e.into_inner());
+        if caller.expires_at >= held.expires_at {
+            *held = caller.clone();
+        }
     }
 }
 
@@ -143,7 +149,12 @@ impl Credentials for Shared {
                 .token(&caller)
                 .await
                 .map(|t| t.to_string())
-                .map_err(|e| origincloud_core::Error::Credentials(e.to_string()))
+                .map_err(|e| {
+                    // The detail is for the logs; the tool's caller is
+                    // told no more than what they can act on.
+                    tracing::warn!(error = %e, "the caller's token couldn't be exchanged");
+                    origincloud_core::Error::Credentials(e.public().to_owned())
+                })
         })
     }
 }

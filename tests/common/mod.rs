@@ -35,6 +35,8 @@ pub const WORKLOAD_ID: &str = "spiffe://test.example/workload/mcp-server";
 pub struct Issuer {
     server: FakeServer,
     id: Arc<OnceLock<String>>,
+    /// How often the key set was fetched.
+    pub key_fetches: Arc<AtomicUsize>,
     key: EncodingKey,
     /// A key of the same id that isn't in the key set.
     impostor: EncodingKey,
@@ -62,6 +64,20 @@ fn key_pair() -> (String, EncodingKey, Value) {
     )
 }
 
+/// The user id of a person known by `name` in a test: `name` itself when it
+/// is one already.
+pub fn person_id(name: &str) -> String {
+    if uuid::Uuid::parse_str(name).is_ok() {
+        return name.to_owned();
+    }
+    let sum: u64 = name.bytes().fold(7, |a, b| a * 31 + u64::from(b));
+    format!(
+        "{:08x}-0000-4000-8000-{:012x}",
+        sum as u32,
+        (sum >> 8) & 0xffff_ffff_ffff
+    )
+}
+
 /// The claims of a JWT, read without checking it.
 pub fn claims(token: &str) -> Value {
     let payload = token.split('.').nth(1).expect("a JWT");
@@ -81,6 +97,8 @@ impl Issuer {
         let (_, impostor, _) = key_pair();
         let id: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
         let (issuer, published) = (Arc::clone(&id), jwk.clone());
+        let key_fetches = Arc::new(AtomicUsize::new(0));
+        let fetches = Arc::clone(&key_fetches);
         let server = FakeServer::start(move |r: Received| {
             let issuer = issuer.get().cloned().unwrap_or_default();
             let response = match (r.method.as_str(), r.path.as_str()) {
@@ -92,6 +110,7 @@ impl Issuer {
                     .to_string(),
                 ),
                 ("GET", "/realms/test/protocol/openid-connect/certs") => {
+                    fetches.fetch_add(1, Ordering::SeqCst);
                     Response::json(json!({ "keys": [published] }).to_string())
                 }
                 _ => Response::json("{}").with_status(404),
@@ -103,6 +122,7 @@ impl Issuer {
         Self {
             server,
             id,
+            key_fetches,
             key,
             impostor,
             jwk,
@@ -132,18 +152,30 @@ impl Issuer {
         jsonwebtoken::encode(&header, &claims, &self.key).expect("a token")
     }
 
+    /// A token of exactly `claims` with a header of the caller's making.
+    pub fn token_without_defaults_with(&self, header: &Header, claims: Value) -> String {
+        jsonwebtoken::encode(header, &claims, &self.key).expect("a token")
+    }
+
     /// The same, signed with a key the issuer doesn't publish.
     pub fn forged(&self, claims: Value) -> String {
         self.sign(&self.impostor, claims)
     }
 
     fn sign(&self, key: &EncodingKey, mut claims: Value) -> String {
-        let defaults =
-            json!({ "iss": self.id(), "iat": now(), "exp": now() + 300, "azp": "origincloud-mcp" });
+        let defaults = json!({
+            "iss": self.id(), "iat": now(), "exp": now() + 300, "azp": "origincloud-mcp",
+            "typ": "Bearer", "email": "person@example.com", "email_verified": true,
+            "name": "A Person", "given_name": "A", "family_name": "Person",
+        });
         for (k, v) in defaults.as_object().unwrap() {
             if claims.get(k).is_none() {
                 claims[k] = v.clone();
             }
+        }
+        // A person is named by a user id, a UUID: a short name is mapped to one.
+        if let Some(sub) = claims["sub"].as_str() {
+            claims["sub"] = person_id(sub).into();
         }
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some("key-1".to_owned());
@@ -189,12 +221,32 @@ impl WorkloadFiles {
 pub struct Sts {
     server: FakeServer,
     key: EncodingKey,
+    impostor: EncodingKey,
     pub exchanges: Arc<Mutex<Vec<Received>>>,
     /// Makes the token endpoint refuse every exchange.
     pub refuse: Arc<AtomicBool>,
     /// Makes it answer `503`.
     pub unavailable: Arc<AtomicBool>,
+    /// The error a refusal answers with (`400`).
+    pub error: Arc<Mutex<String>>,
+    /// How long an exchange takes, in milliseconds.
+    pub delay_ms: Arc<AtomicUsize>,
 }
+
+/// A fresh Ed25519 key as the STS signs with: its encoding key and the
+/// public key's base64url.
+fn ed_key_pair() -> (EncodingKey, String) {
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
+    let key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let der = key.to_pkcs8_der().expect("a DER");
+    (
+        EncodingKey::from_ed_der(der.as_bytes()),
+        URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()),
+    )
+}
+
+/// The key id the fake STS names in its tokens, as the real one does.
+pub const STS_KID: &str = "sts-key-1";
 
 fn components(jwk: &Value) -> DecodingKey {
     DecodingKey::from_ec_components(jwk["x"].as_str().unwrap(), jwk["y"].as_str().unwrap())
@@ -202,8 +254,8 @@ fn components(jwk: &Value) -> DecodingKey {
 }
 
 /// Whether `token`'s signature is `key`'s, whatever its claims say.
-fn signed_by(token: &str, key: &DecodingKey) -> bool {
-    let mut validation = Validation::new(Algorithm::ES256);
+fn signed_by(token: &str, key: &DecodingKey, alg: Algorithm) -> bool {
+    let mut validation = Validation::new(alg);
     validation.validate_aud = false;
     validation.validate_exp = false;
     validation.required_spec_claims.clear();
@@ -212,15 +264,20 @@ fn signed_by(token: &str, key: &DecodingKey) -> bool {
 
 impl Sts {
     pub async fn start(realm: Value, workload: Value) -> Self {
-        let (_, key, jwk) = key_pair();
+        let (key, public) = ed_key_pair();
+        let (impostor, _) = ed_key_pair();
         let exchanges = Arc::new(Mutex::new(Vec::new()));
         let refuse = Arc::new(AtomicBool::new(false));
         let unavailable = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new("invalid_grant".to_owned()));
+        let delay_ms = Arc::new(AtomicUsize::new(0));
         let count = Arc::new(AtomicUsize::new(0));
-        let (seen, refusing, down) = (
+        let (seen, refusing, down, code, delay) = (
             Arc::clone(&exchanges),
             Arc::clone(&refuse),
             Arc::clone(&unavailable),
+            Arc::clone(&error),
+            Arc::clone(&delay_ms),
         );
         let server = FakeServer::start(move |r: Received| {
             let response = if (r.method.as_str(), r.path.as_str()) != ("POST", "/v1/token") {
@@ -231,25 +288,34 @@ impl Sts {
                     Response::json(json!({ "error": "temporarily_unavailable" }).to_string())
                         .with_status(503)
                 } else {
+                    let code = code.lock().unwrap().clone();
                     exchange(
                         &r,
                         &count,
                         refusing.load(Ordering::SeqCst),
                         &realm,
                         &workload,
-                        &jwk,
+                        &public,
+                        &code,
                     )
                 }
             };
-            async move { response }
+            let wait = delay.load(Ordering::SeqCst) as u64;
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                response
+            }
         })
         .await;
         Self {
             server,
             key,
+            impostor,
             exchanges,
             refuse,
             unavailable,
+            error,
+            delay_ms,
         }
     }
 
@@ -257,9 +323,7 @@ impl Sts {
         self.server.url()
     }
 
-    /// A token of this STS's zone `zone`, of `claims` completed with the
-    /// issuer and a lifetime unless they name their own.
-    pub fn token(&self, zone: &str, mut claims: Value) -> String {
+    fn complete(zone: &str, mut claims: Value) -> Value {
         let defaults = json!({
             "iss": format!("origincloud:sts:{zone}"),
             "iat": now(),
@@ -271,18 +335,35 @@ impl Sts {
                 claims[k] = v.clone();
             }
         }
-        jsonwebtoken::encode(&Header::new(Algorithm::ES256), &claims, &self.key).expect("a token")
+        claims
+    }
+
+    /// A token of this STS's zone `zone`, of `claims` completed with the
+    /// issuer and a lifetime unless they name their own, signed EdDSA with
+    /// a named key as the real STS does.
+    pub fn token(&self, zone: &str, claims: Value) -> String {
+        self.sign(&self.key, zone, claims)
     }
 
     /// The same, signed with a key this STS doesn't hold.
     pub fn forged(&self, zone: &str, claims: Value) -> String {
-        let (_, impostor, _) = key_pair();
-        let token = self.token(zone, claims);
-        let (signing_input, _) = token.rsplit_once('.').unwrap();
-        let forged =
-            jsonwebtoken::crypto::sign(signing_input.as_bytes(), &impostor, Algorithm::ES256)
-                .unwrap();
-        format!("{signing_input}.{forged}")
+        self.sign(&self.impostor, zone, claims)
+    }
+
+    fn sign(&self, key: &EncodingKey, zone: &str, claims: Value) -> String {
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(STS_KID.to_owned());
+        jsonwebtoken::encode(&header, &Self::complete(zone, claims), key).expect("a token")
+    }
+
+    /// A token with a header of the caller's making, signed with whichever
+    /// key suits `header.alg`.
+    pub fn token_with(&self, header: &Header, zone: &str, claims: Value) -> String {
+        let key = match header.alg {
+            Algorithm::EdDSA => self.key.clone(),
+            _ => key_pair().1,
+        };
+        jsonwebtoken::encode(header, &Self::complete(zone, claims), &key).expect("a token")
     }
 
     pub fn exchanges(&self) -> Vec<Received> {
@@ -295,18 +376,16 @@ pub fn form(r: &Received) -> Vec<(String, String)> {
     url::form_urlencoded::parse(&r.body).into_owned().collect()
 }
 
-fn invalid_grant() -> Response {
-    Response::json(json!({ "error": "invalid_grant" }).to_string()).with_status(400)
-}
-
 fn exchange(
     r: &Received,
     count: &AtomicUsize,
     refuse: bool,
     realm: &Value,
     workload: &Value,
-    sts: &Value,
+    sts: &str,
+    error: &str,
 ) -> Response {
+    let invalid_grant = || Response::json(json!({ "error": error }).to_string()).with_status(400);
     let form = form(r);
     let get = |k: &str| {
         form.iter()
@@ -344,16 +423,20 @@ fn exchange(
     }
     // The subject: signed by the realm, or by this STS.
     let sub = claims(&subject);
-    let key = if sub["iss"]
+    let signed = if sub["iss"]
         .as_str()
         .unwrap_or_default()
         .starts_with("origincloud:sts:")
     {
-        sts
+        signed_by(
+            &subject,
+            &DecodingKey::from_ed_components(sts).unwrap(),
+            Algorithm::EdDSA,
+        )
     } else {
-        realm
+        signed_by(&subject, &components(realm), Algorithm::ES256)
     };
-    if !signed_by(&subject, &components(key)) {
+    if !signed {
         return invalid_grant();
     }
     let n = count.fetch_add(1, Ordering::SeqCst) + 1;

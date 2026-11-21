@@ -27,9 +27,13 @@ use serde::Serialize;
 /// The RFC 8693 `actor_token_type` of an assertion of a workload.
 pub const ASSERTION_TOKEN_TYPE: &str = "urn:origincloud:params:oauth:token-type:workload-assertion";
 
-/// How long an assertion lives: it is made for one exchange, and the STS
-/// takes none that lives longer than this.
+/// How long an assertion lives, from its `iat`: it is made for one
+/// exchange, and the STS takes none that lives longer than 60 seconds.
 const ASSERTION_LIFETIME_SECONDS: u64 = 60;
+
+/// How far `iat` is put back, so that an STS whose clock is a little behind
+/// doesn't find the assertion issued in its future.
+const BACKDATE_SECONDS: u64 = 5;
 
 /// Why no assertion could be made.
 #[derive(Debug, thiserror::Error)]
@@ -87,7 +91,8 @@ impl Workload {
         }
     }
 
-    /// An assertion valid from `now` (seconds since the epoch) for a minute.
+    /// An assertion made at `now` (seconds since the epoch): issued a few
+    /// seconds before, living a minute from then.
     pub async fn assertion(&self, now: u64) -> Result<String, WorkloadError> {
         let key = self.read("workload.key").await?;
         let certificate = first_certificate("workload.crt", &self.read("workload.crt").await?)?;
@@ -97,12 +102,13 @@ impl Workload {
             .map_err(|_| WorkloadError::NotPem("workload.key"))?;
         let mut header = Header::new(Algorithm::ES256);
         header.x5c = Some(vec![certificate, intermediate, root]);
+        let issued = now.saturating_sub(BACKDATE_SECONDS);
         let claims = Claims {
             iss: &self.id,
             sub: &self.id,
             aud: &self.audience,
-            iat: now,
-            exp: now + ASSERTION_LIFETIME_SECONDS,
+            iat: issued,
+            exp: issued + ASSERTION_LIFETIME_SECONDS,
             jti: uuid::Uuid::new_v4().to_string(),
         };
         Ok(jsonwebtoken::encode(&header, &claims, &key)?)

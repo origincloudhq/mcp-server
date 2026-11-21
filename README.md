@@ -61,13 +61,24 @@ requires:
    - **The realm people sign in at.** The token must be a JWT signed with a
      key of the realm's JWKS (fetched from its OpenID configuration, kept
      for ten minutes, fetched again for a key it doesn't know) and issued by
-     the realm. Any client's token is accepted.
+     the realm. Any client's token is accepted, if it is a person's access
+     token as the STS requires it (type `Bearer`, a user id as the subject,
+     and the `email`, `email_verified`, `name`, `given_name` and
+     `family_name` claims): anything else is refused early.
    - **A zone's security token service (STS)**, whose tokens name it as
      `origincloud:sts:<zone>`, such as a service account's token for this
      server's audience. Its issuer, audience and lifetime are checked here;
      its signature is checked by the STS itself when the server exchanges the
      token (see 5), which the server does before it serves the request: a
-     token the STS doesn't accept is refused with `401`.
+     token the STS doesn't accept is refused with `401`. The STS signs EdDSA
+     and names its key, so a token that doesn't is refused without asking it.
+     Such exchanges of tokens nobody has checked are limited (a few at once,
+     a few dozen a second); past the limit the request is answered `503` with
+     `Retry-After`, counted as `unavailable`. A token the STS accepted once,
+     and a realm's token, aren't limited.
+
+   A token is refused if it is longer than 16 KiB, expired, or expires more
+   than seven days ahead.
 
    A token of any other issuer is refused. `--allowed-clients` optionally
    restricts the server to tokens issued to some clients (`azp`); it is empty
@@ -84,7 +95,13 @@ requires:
    below). The issued token keeps the caller as its subject and names this
    server as the party acting for them (`act`). It is kept until shortly
    before it expires, and never past the caller's token; a token the STS
-   refused isn't asked about again for thirty seconds. The caller's token is
+   refused (`invalid_grant`, and nothing else) isn't asked about again for
+   thirty seconds, unless it isn't valid yet; callers presenting the same
+   token at once share one exchange. Any other error of the STS (`invalid_request`,
+   `invalid_client`, `invalid_target`, ...) is this server's own fault, not
+   the token's: it is logged as an error, answered `503`, and not remembered.
+   Callers of a tool are told no more than that the token couldn't be
+   exchanged; the detail is in the logs. The caller's token is
    never sent anywhere but to the STS that exchanges it.
 
 The hosted server is for people signing in through their MCP client, and for
@@ -101,7 +118,8 @@ what the enrolment client keeps: `workload.key` (PKCS#8 PEM), `workload.crt`,
 `chain.crt` (the intermediate) and `root.crt`. For each exchange the server
 signs a one-minute assertion with that key (ES256; the certificate, the
 intermediate and the root in `x5c`; the workload's SPIFFE id, `--workload-id`,
-as issuer and subject; the STS of `--sts-zone` as audience). The STS takes only
+as issuer and subject; the STS of `--sts-zone` as audience; issued five
+seconds before it is made, so that a clock a little behind doesn't refuse it). The STS takes only
 the one workload it is configured with, and only while the authority lists its
 certificate as live. The files are read for every assertion, so a renewed
 certificate is used at once, and the key never leaves the process. Without the
@@ -131,7 +149,7 @@ them. The defaults are Origin Cloud's production values.
 | `--issuer` | `MCP_ISSUER` | `https://auth.origincloud.eu/realms/origincloud` | The realm people sign in at, the authorization server clients log in to |
 | `--scopes` | `MCP_SCOPES` | `mcp` | The scopes a client requests, space-separated |
 | `--allowed-clients` | `MCP_ALLOWED_CLIENTS` | none | Restricts the server to tokens issued to these clients, comma-separated; any client's token otherwise |
-| `--sts-url` | `MCP_STS_URL` | none, required | The base URL of the STS that exchanges tokens, as its zone's workloads reach it; `https` |
+| `--sts-url` | `MCP_STS_URL` | none, required | The base URL of the STS that exchanges tokens, as its zone's workloads reach it; `https`. Its host must be the STS's internal name: the STS decides by the request's `Host` whether it takes an actor's exchange, and refuses it on its public name |
 | `--sts-zone` | `MCP_STS_ZONE` | none, required | The zone of that STS |
 | `--sts-ca-file` | `MCP_STS_CA_FILE` | none | PEM certificates that are the only trust for the STS's name |
 | `--workload-dir` | `MCP_WORKLOAD_DIR` | none, required | The directory of the server's workload certificate |

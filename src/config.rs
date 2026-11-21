@@ -72,8 +72,11 @@ pub struct Config {
     pub allowed_clients: Vec<String>,
 
     /// The base URL of the STS that exchanges callers' tokens, as its zone's
-    /// workloads reach it. The assertion proving this server goes there, so
-    /// it must be `https` (`http` on this machine only).
+    /// workloads reach it: the STS decides by the request's `Host` whether
+    /// it takes an actor's exchange, and takes it on its internal name only,
+    /// so the URL's host must be that name, not the public one. The
+    /// assertion proving this server goes there, so it must be `https`
+    /// (`http` on this machine only).
     #[arg(long, env = "MCP_STS_URL")]
     pub sts_url: Url,
 
