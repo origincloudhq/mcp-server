@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{claims, everything, now, Harness, API_AUDIENCE};
+use common::{claims, everything, form, now, Harness, API_AUDIENCE, WORKLOAD_ID, ZONE};
 use fake_server::{Received, Response};
 use origincloud_mcp::{ClientSource, Options};
 use rmcp::ServerHandler;
@@ -79,76 +79,48 @@ async fn a_token_issued_for_another_audience_is_refused() {
         challenge.contains(&format!("the token wasn't issued for {}", h.url)),
         "{challenge}"
     );
-    assert!(h.issuer.exchanges().is_empty(), "nothing is exchanged");
+    assert!(h.sts.exchanges().is_empty(), "nothing is exchanged");
     assert!(h.api.received().is_empty(), "nothing reaches the API");
 }
 
-/// A service account's token: Keycloak's client credentials grant, issued to
-/// the account's own client, with the claims that grant sets.
+/// A token for the server's audience is served whatever client it was
+/// issued to, such as a client of a dynamic registration or a client's own
+/// credentials.
 #[tokio::test]
-async fn a_service_account_s_token_is_refused_before_any_exchange() {
-    let h = Harness::start(pvs).await;
-    let account = "sa-0b5e2c1a-7d4f-4e0a-9c3b-2f6d8e1a4b7c";
-    let token = h.issuer.token(json!({
-        "sub": "5f1c9e2a-3b7d-4c8e-a1f0-6d2b9e4c7a13",
-        "aud": [h.url.clone(), "origincloud-mcp-server"],
-        "azp": account,
-        "client_id": account,
-        "clientHost": "203.0.113.7",
-        "clientAddress": "203.0.113.7",
-        "scope": "mcp",
-    }));
-
-    let response = h.post("", Some(&format!("Bearer {token}"))).await;
-    assert_eq!(response.status(), 403);
-    let challenge = header(&response, "www-authenticate").to_owned();
-    assert!(challenge.starts_with("Bearer "), "{challenge}");
-    assert!(
-        challenge.contains("error=\"insufficient_scope\""),
-        "{challenge}"
-    );
-    assert!(
-        challenge.contains(&format!(
-            "resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
-            h.url
-        )),
-        "{challenge}"
-    );
-    assert!(
-        !challenge.contains("scope=\"mcp\""),
-        "a scope no service account can use: {challenge}"
-    );
-    assert!(challenge.contains("origin mcp serve"), "{challenge}");
-    let body: Value = response.json().await.unwrap();
-    assert_eq!(body["error"], "insufficient_scope");
-    assert!(
-        body["error_description"]
-            .as_str()
-            .unwrap()
-            .contains("origin mcp serve"),
-        "{body}"
-    );
-
-    assert!(h.issuer.exchanges().is_empty(), "the token was exchanged");
-    assert!(h.api.received().is_empty(), "something reached the API");
-    let metrics = reqwest::get(format!("{}/metrics", h.metrics_url))
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(
-        metrics.contains("origincloud_mcp_auth_refusals_total{reason=\"client\"}"),
-        "{metrics}"
-    );
-}
-
-/// A token for the server's audience issued to another client than the one
-/// people sign in to it with, or naming none, is refused the same way.
-#[tokio::test]
-async fn a_token_of_another_client_is_refused() {
+async fn a_token_of_any_client_is_served() {
     let h = Harness::start(pvs).await;
     let aud = json!([h.url.clone(), "origincloud-mcp-server"]);
+    let mut tokens = vec![];
+    for azp in ["origin-cli", "https://client.example/metadata.json", ""] {
+        tokens.push((
+            azp,
+            h.issuer
+                .token(json!({ "sub": "alice", "aud": aud, "azp": azp })),
+        ));
+    }
+    // The fake issuer's defaults name a client; this token names none.
+    let mut claims = claims(&h.token_for("alice"));
+    claims.as_object_mut().unwrap().remove("azp");
+    tokens.push(("none", h.issuer.token_without_defaults(claims)));
+    for (client, token) in &tokens {
+        let response = h.post("", Some(&format!("Bearer {token}"))).await;
+        assert_eq!(response.status(), 200, "the token of client {client:?}");
+    }
+    let agent = h.connect(&tokens[0].1, "").await;
+    let read = agent
+        .call("pvs_get_volume", json!({ "name": VOLUME }))
+        .await;
+    assert_ne!(read.is_error, Some(true), "{read:?}");
+}
+
+/// With `--allowed-clients`, a token of another client, or of none, such as
+/// a zone STS's, is refused before any exchange.
+#[tokio::test]
+async fn a_server_restricted_to_clients_refuses_the_others() {
+    let h = Harness::start_with(pvs, &["--allowed-clients", "origincloud-mcp"]).await;
+    let aud = json!([h.url.clone(), "origincloud-mcp-server"]);
+    let mut clientless = claims(&h.token_for("alice"));
+    clientless.as_object_mut().unwrap().remove("azp");
     let tokens = [
         (
             "another client's",
@@ -160,23 +132,31 @@ async fn a_token_of_another_client_is_refused() {
             h.issuer
                 .token(json!({ "sub": "alice", "aud": aud, "azp": "" })),
         ),
-        ("a clientless", {
-            // The fake issuer's defaults name the login client; this names none.
-            let mut claims = common::claims(&h.token_for("alice"));
-            claims.as_object_mut().unwrap().remove("azp");
-            h.issuer.token_without_defaults(claims)
-        }),
+        ("a clientless", h.issuer.token_without_defaults(clientless)),
+        (
+            "a zone STS's",
+            h.sts.token(ZONE, json!({ "sub": "sa", "aud": aud })),
+        ),
     ];
     for (what, token) in tokens {
         let response = h.post("", Some(&format!("Bearer {token}"))).await;
         assert_eq!(response.status(), 403, "{what} token");
-        assert!(
-            header(&response, "www-authenticate").contains("insufficient_scope"),
-            "{what} token"
-        );
+        let challenge = header(&response, "www-authenticate");
+        assert!(challenge.contains("insufficient_scope"), "{what} token");
+        assert!(!challenge.contains("scope=\"mcp\""), "{challenge}");
     }
-    assert!(h.issuer.exchanges().is_empty());
+    assert!(h.sts.exchanges().is_empty());
     assert!(h.api.received().is_empty());
+    let metrics = reqwest::get(format!("{}/metrics", h.metrics_url))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("origincloud_mcp_auth_refusals_total{reason=\"client\"}"),
+        "{metrics}"
+    );
 
     // The login client's token still works.
     let agent = h.connect(&h.token_for("alice"), "").await;
@@ -185,6 +165,189 @@ async fn a_token_of_another_client_is_refused() {
         .await;
     assert_ne!(read.is_error, Some(true), "{read:?}");
     assert_eq!(h.api.received().len(), 1);
+}
+
+/// A service account's token of a zone's STS for the server's audience is
+/// served: the STS checks its signature when the server exchanges it, and the
+/// token the API receives is the exchanged one.
+#[tokio::test]
+async fn a_service_account_s_sts_token_is_served() {
+    let h = Harness::start(pvs).await;
+    let account = "//iam.example/organizations/o/serviceAccounts/sa-1";
+    // From any zone: the STS of another zone than the server's.
+    let token = h.sts.token(
+        "other-zone-9",
+        json!({ "sub": account, "aud": [h.url.clone()] }),
+    );
+    let agent = h.connect(&token, "").await;
+
+    let read = agent
+        .call("pvs_get_volume", json!({ "name": VOLUME }))
+        .await;
+    assert_ne!(read.is_error, Some(true), "{read:?}");
+    let received = h.api.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0].header("authorization"),
+        Some(format!("Bearer exchanged-{account}-1").as_str())
+    );
+    assert!(!everything(&received[0]).contains(&token));
+    // Checked by the exchange that admitted the request, and used by the call.
+    assert_eq!(h.sts.exchanges().len(), 1);
+}
+
+/// What the STS is sent: the caller's token as subject, the server's
+/// workload assertion as actor, and nothing else.
+#[tokio::test]
+async fn the_exchange_names_the_caller_and_proves_the_server() {
+    let h = Harness::start(pvs).await;
+    let token = h.token_for("alice");
+    let agent = h.connect(&token, "").await;
+    agent
+        .call("pvs_get_volume", json!({ "name": VOLUME }))
+        .await;
+
+    let exchanges = h.sts.exchanges();
+    assert_eq!(exchanges.len(), 1);
+    let form = form(&exchanges[0]);
+    let get = |k: &str| {
+        form.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(
+        get("grant_type"),
+        Some("urn:ietf:params:oauth:grant-type:token-exchange")
+    );
+    assert_eq!(get("subject_token"), Some(token.as_str()));
+    assert_eq!(
+        get("subject_token_type"),
+        Some("urn:ietf:params:oauth:token-type:access_token")
+    );
+    assert_eq!(
+        get("requested_token_type"),
+        Some("urn:ietf:params:oauth:token-type:access_token")
+    );
+    assert_eq!(
+        get("actor_token_type"),
+        Some("urn:origincloud:params:oauth:token-type:workload-assertion")
+    );
+    let actor = claims(get("actor_token").expect("an actor token"));
+    assert_eq!(actor["iss"], WORKLOAD_ID);
+    assert_eq!(actor["sub"], WORKLOAD_ID);
+    assert_eq!(actor["aud"], format!("origincloud:sts:{ZONE}"));
+    // No client credentials of any kind, and no audience: the STS issues
+    // for the API.
+    assert!(exchanges[0].header("authorization").is_none());
+    assert!(get("audience").is_none());
+}
+
+/// A token of the STS the server can refuse itself is refused without
+/// asking the STS; one with a forged signature is the STS's to find.
+#[tokio::test]
+async fn a_bad_sts_token_is_refused() {
+    let h = Harness::start(pvs).await;
+    let aud = json!([h.url.clone()]);
+    let local = [
+        (
+            "for another audience",
+            h.sts
+                .token(ZONE, json!({ "sub": "sa", "aud": API_AUDIENCE })),
+        ),
+        (
+            "expired",
+            h.sts
+                .token(ZONE, json!({ "sub": "sa", "aud": aud, "exp": now() - 120 })),
+        ),
+        (
+            "not yet valid",
+            h.sts
+                .token(ZONE, json!({ "sub": "sa", "aud": aud, "nbf": now() + 600 })),
+        ),
+        (
+            "of an unknown issuer",
+            h.sts.token(
+                ZONE,
+                json!({ "sub": "sa", "aud": aud, "iss": "origincloud:other" }),
+            ),
+        ),
+        (
+            "of a malformed zone",
+            h.sts.token(
+                ZONE,
+                json!({ "sub": "sa", "aud": aud, "iss": "origincloud:sts:../x" }),
+            ),
+        ),
+        ("subjectless", h.sts.token(ZONE, json!({ "aud": aud }))),
+    ];
+    for (what, token) in local {
+        let response = h.post("", Some(&format!("Bearer {token}"))).await;
+        assert_eq!(response.status(), 401, "a token {what}");
+        assert!(
+            header(&response, "www-authenticate").contains("invalid_token"),
+            "a token {what}"
+        );
+    }
+    assert!(h.sts.exchanges().is_empty(), "nothing was exchanged");
+
+    // The same forged token isn't asked about again at once.
+    let forged = h.sts.forged(ZONE, json!({ "sub": "sa", "aud": aud }));
+    for _ in 0..3 {
+        let response = h.post("", Some(&format!("Bearer {forged}"))).await;
+        assert_eq!(response.status(), 401, "a forged token");
+    }
+    assert_eq!(h.sts.exchanges().len(), 1);
+    assert!(h.api.received().is_empty());
+}
+
+/// An STS that can't answer decides nothing about a token: the request is
+/// answered `503` to retry, while a realm's token is still served.
+#[tokio::test]
+async fn an_sts_that_cannot_answer_is_unavailable_not_a_refusal() {
+    let h = Harness::start(pvs).await;
+    h.sts
+        .unavailable
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let token = h
+        .sts
+        .token(ZONE, json!({ "sub": "sa", "aud": [h.url.clone()] }));
+    let response = h.post("", Some(&format!("Bearer {token}"))).await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(header(&response, "retry-after"), "5");
+
+    let people = h
+        .post("", Some(&format!("Bearer {}", h.token_for("alice"))))
+        .await;
+    assert_eq!(people.status(), 200);
+
+    // Asked again once it answers: the outage wasn't remembered.
+    h.sts
+        .unavailable
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let response = h.post("", Some(&format!("Bearer {token}"))).await;
+    assert_eq!(response.status(), 200);
+}
+
+/// Without its certificate the server can't exchange: a tool call fails,
+/// and an STS token is answered `503` rather than as refused.
+#[tokio::test]
+async fn a_server_without_its_certificate_cannot_exchange() {
+    let h = Harness::start(pvs).await;
+    std::fs::remove_file(h.workload.dir.path().join("workload.key")).unwrap();
+
+    let agent = h.connect(&h.token_for("alice"), "").await;
+    let read = agent
+        .call("pvs_get_volume", json!({ "name": VOLUME }))
+        .await;
+    assert_eq!(read.is_error, Some(true));
+    assert!(h.api.received().is_empty());
+
+    let token = h
+        .sts
+        .token(ZONE, json!({ "sub": "sa", "aud": [h.url.clone()] }));
+    let response = h.post("", Some(&format!("Bearer {token}"))).await;
+    assert_eq!(response.status(), 503);
+    assert!(h.sts.exchanges().is_empty());
 }
 
 #[tokio::test]
@@ -249,35 +412,7 @@ async fn a_tool_call_reaches_the_api_with_an_exchanged_token_never_the_caller_s(
     }
 
     // One exchange, its token used for both calls until it is due.
-    let exchanges = h.issuer.exchanges();
-    assert_eq!(exchanges.len(), 1);
-    let form: Vec<(String, String)> = url::form_urlencoded::parse(&exchanges[0].body)
-        .into_owned()
-        .collect();
-    let get = |k: &str| {
-        form.iter()
-            .find(|(key, _)| key == k)
-            .map(|(_, v)| v.as_str())
-    };
-    assert_eq!(
-        get("grant_type"),
-        Some("urn:ietf:params:oauth:grant-type:token-exchange")
-    );
-    assert_eq!(get("subject_token"), Some(token.as_str()));
-    assert_eq!(
-        get("subject_token_type"),
-        Some("urn:ietf:params:oauth:token-type:access_token")
-    );
-    assert_eq!(
-        get("requested_token_type"),
-        Some("urn:ietf:params:oauth:token-type:access_token")
-    );
-    assert_eq!(get("audience"), Some(API_AUDIENCE));
-    // As the server's own client, which the fake checks.
-    assert!(exchanges[0]
-        .header("authorization")
-        .unwrap()
-        .starts_with("Basic "));
+    assert_eq!(h.sts.exchanges().len(), 1);
     assert_eq!(claims(&token)["sub"], "alice");
 }
 
@@ -307,7 +442,7 @@ async fn each_caller_calls_with_a_token_exchanged_for_their_own() {
 #[tokio::test]
 async fn a_refused_exchange_is_the_tool_s_error_and_reaches_no_api() {
     let h = Harness::start(pvs).await;
-    h.issuer
+    h.sts
         .refuse
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let agent = h.connect(&h.token_for("alice"), "").await;

@@ -5,11 +5,13 @@
 //! - A request without a bearer token issued for this server is answered
 //!   `401` with a `WWW-Authenticate` challenge naming the protected resource
 //!   metadata (RFC 9728), which names the authorization server.
-//! - A valid token issued to another client than the one people sign in
-//!   with, such as a service account's, is answered `403`
-//!   (`insufficient_scope`) before it is exchanged.
-//! - A tool call reaches the API with a token exchanged for the caller's
-//!   (RFC 8693), never with the caller's own; see [`exchange`].
+//! - Any valid token for this server's audience is served, whatever the
+//!   client, if the realm people sign in at or a zone's STS issued it. With
+//!   `--allowed-clients` set, a token of another client is answered `403`
+//!   (`insufficient_scope`).
+//! - A tool call reaches the API with a token the STS exchanged for the
+//!   caller's (RFC 8693), which keeps the caller and names this server as
+//!   acting for them, never with the caller's own; see [`exchange`].
 //! - The connection's toolsets and read-only mode come from the URL's query;
 //!   see [`options`].
 //!
@@ -24,6 +26,7 @@ mod exchange;
 mod metrics;
 pub mod options;
 mod session;
+mod workload;
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,11 +48,12 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 
-use crate::auth::{Authenticator, Caller, Issuer, Refusal};
+use crate::auth::{Authenticator, Caller, Issuer, Proof, Refusal};
 use crate::clients::{Api, Registry};
 use crate::config::Config;
-use crate::exchange::Exchanger;
+use crate::exchange::{ExchangeError, Exchanger};
 use crate::session::Session;
+use crate::workload::Workload;
 
 /// How often the issuer's configuration is asked for until it answers.
 const DISCOVERY_RETRY: Duration = Duration::from_secs(5);
@@ -64,6 +68,7 @@ struct Shared {
     config: Config,
     issuer: Arc<Issuer>,
     authenticator: Authenticator,
+    exchanger: Arc<Exchanger>,
     registry: Arc<Registry>,
     transport: StreamableHttpServerConfig,
     cancel: CancellationToken,
@@ -84,21 +89,28 @@ impl Server {
         let authenticator = Authenticator::new(
             Arc::clone(&issuer),
             config.accepted_audience(),
-            config.allowed_clients.clone(),
+            config
+                .allowed_clients
+                .iter()
+                .map(|c| c.trim().to_owned())
+                .filter(|c| !c.is_empty())
+                .collect(),
         );
         let exchanger = Arc::new(Exchanger::new(
-            http.clone(),
-            Arc::clone(&issuer),
-            config.exchange_client_id.clone(),
-            config.exchange_client_secret.clone(),
-            config.api_audience.clone(),
+            sts_client(&config)?,
+            &config.sts_url,
+            Workload::new(
+                config.workload_dir.clone(),
+                config.workload_id.clone(),
+                &config.sts_zone,
+            ),
         ));
         let registry = Arc::new(Registry::new(
             Api {
                 region: config.api_region.clone(),
                 endpoint: config.api_endpoint.clone(),
             },
-            exchanger,
+            Arc::clone(&exchanger),
             http,
         ));
         let cancel = CancellationToken::new();
@@ -112,6 +124,7 @@ impl Server {
                 config,
                 issuer,
                 authenticator,
+                exchanger,
                 registry,
                 transport,
                 cancel,
@@ -254,7 +267,7 @@ async fn mcp(State(state): State<Arc<Shared>>, mut request: Request) -> Response
             )
                 .into_response(),
         };
-    let caller = match state.authenticator.authenticate(request.headers()).await {
+    let caller = match admit(&state, request.headers()).await {
         Ok(caller) => caller,
         Err(refusal) => return refuse(&state, refusal),
     };
@@ -274,6 +287,50 @@ async fn mcp(State(state): State<Arc<Shared>>, mut request: Request) -> Response
     response
 }
 
+/// The caller of a request. A token whose signature this server can't check
+/// (a zone STS's) is exchanged now, which is the STS checking it: the
+/// request is served only if the STS took the token, and the exchanged token
+/// is kept for the tool calls that follow.
+async fn admit(state: &Shared, headers: &http::HeaderMap) -> Result<Caller, Refusal> {
+    let caller = state.authenticator.authenticate(headers).await?;
+    if caller.proof == Proof::Exchange {
+        state
+            .exchanger
+            .token(&caller)
+            .await
+            .map_err(|error| match error {
+                ExchangeError::Expired | ExchangeError::Refused { .. } => {
+                    Refusal::Invalid("the STS didn't accept the token".to_owned())
+                }
+                error => Refusal::Unavailable(error.to_string()),
+            })?;
+    }
+    Ok(caller)
+}
+
+/// The HTTP client for the STS: no redirect is followed, since the
+/// assertion and the callers' tokens go to the configured STS alone, and
+/// the configured certificates are its only trust when given.
+fn sts_client(config: &Config) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!(
+            "origincloud-mcp-server/",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(path) = &config.sts_ca_file {
+        let pem = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("the STS's CA file {}: {e}", path.display()))?;
+        let roots = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|e| anyhow::anyhow!("the STS's CA file {}: {e}", path.display()))?;
+        if roots.is_empty() {
+            anyhow::bail!("the STS's CA file {} holds no certificate", path.display());
+        }
+        builder = builder.tls_certs_only(roots);
+    }
+    Ok(builder.build()?)
+}
+
 /// The answer to a request whose token was refused.
 fn refuse(state: &Shared, refusal: Refusal) -> Response {
     metrics::refusal(refusal.reason());
@@ -283,7 +340,7 @@ fn refuse(state: &Shared, refusal: Refusal) -> Response {
             tracing::error!(%error, "a token couldn't be checked");
             let mut response = (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "temporarily_unavailable", "error_description": "the authorization server can't be reached" })),
+                Json(json!({ "error": "temporarily_unavailable", "error_description": "the token can't be checked now" })),
             )
                 .into_response();
             response

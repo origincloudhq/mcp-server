@@ -21,6 +21,7 @@ origincloud-core = { git = "https://github.com/origincloudhq/sdk-rust", rev = "3
 
 anyhow = "1"
 axum = "0.8"
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 http = "1"
 jsonwebtoken = "9"
@@ -40,9 +41,9 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-base64 = "0.22"
 # The SDK's fake API, at the same commit as the SDK.
 fake-server = { git = "https://github.com/origincloudhq/sdk-rust", rev = "37d10062c771d17b86d9907f94380930a48e85ba" }
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 rmcp = { version = "3", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+tempfile = "3"

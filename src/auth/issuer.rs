@@ -1,5 +1,5 @@
-//! The authorization server: its OpenID configuration and the keys it signs
-//! tokens with.
+//! The Keycloak realm people sign in at: its OpenID configuration and the keys
+//! it signs tokens with.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +25,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Metadata {
     pub issuer: String,
     pub jwks_uri: String,
-    pub token_endpoint: String,
 }
 
 /// Why the issuer couldn't be asked.
