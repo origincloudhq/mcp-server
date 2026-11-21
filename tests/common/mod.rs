@@ -386,6 +386,10 @@ fn exchange(
     error: &str,
 ) -> Response {
     let invalid_grant = || Response::json(json!({ "error": error }).to_string()).with_status(400);
+    // The actor's assertion not accepted: the acting client failed to
+    // authenticate (RFC 6749, section 5.2), as the real STS answers it.
+    let invalid_client =
+        || Response::json(json!({ "error": "invalid_client" }).to_string()).with_status(401);
     let form = form(r);
     let get = |k: &str| {
         form.iter()
@@ -412,14 +416,14 @@ fn exchange(
     validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
     let Ok(asserted) = jsonwebtoken::decode::<Value>(&actor, &components(workload), &validation)
     else {
-        return invalid_grant();
+        return invalid_client();
     };
     let a = asserted.claims;
     if a["sub"] != WORKLOAD_ID
         || a["exp"].as_u64().unwrap() - a["iat"].as_u64().unwrap() > 60
         || a["jti"].as_str().is_none_or(str::is_empty)
     {
-        return invalid_grant();
+        return invalid_client();
     }
     // The subject: signed by the realm, or by this STS.
     let sub = claims(&subject);

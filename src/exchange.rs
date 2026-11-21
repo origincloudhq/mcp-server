@@ -317,19 +317,23 @@ impl Exchanger {
     }
 
     /// A place among the exchanges of unchecked tokens, or [`ExchangeError::Busy`].
+    /// The place is taken first: a request turned away because all of them
+    /// are taken mustn't use up the rate.
     fn admit_unproven(&self) -> Result<tokio::sync::SemaphorePermit<'_>, ExchangeError> {
-        {
-            let mut bucket = self.rate.lock().unwrap_or_else(|e| e.into_inner());
-            let elapsed = bucket.at.elapsed().as_secs_f64();
-            bucket.at = Instant::now();
-            bucket.tokens =
-                (bucket.tokens + elapsed * UNPROVEN_PER_SECOND).min(UNPROVEN_PER_SECOND * 2.0);
-            if bucket.tokens < 1.0 {
-                return Err(ExchangeError::Busy);
-            }
-            bucket.tokens -= 1.0;
+        let permit = self
+            .unproven
+            .try_acquire()
+            .map_err(|_| ExchangeError::Busy)?;
+        let mut bucket = self.rate.lock().unwrap_or_else(|e| e.into_inner());
+        let elapsed = bucket.at.elapsed().as_secs_f64();
+        bucket.at = Instant::now();
+        bucket.tokens =
+            (bucket.tokens + elapsed * UNPROVEN_PER_SECOND).min(UNPROVEN_PER_SECOND * 2.0);
+        if bucket.tokens < 1.0 {
+            return Err(ExchangeError::Busy);
         }
-        self.unproven.try_acquire().map_err(|_| ExchangeError::Busy)
+        bucket.tokens -= 1.0;
+        Ok(permit)
     }
 
     /// The exchange itself (RFC 8693, section 2.1): the caller's token as
@@ -596,6 +600,24 @@ mod tests {
         // Not remembered beyond the flight: asked again.
         let _ = exchanger.token(&caller("same")).await;
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn requests_turned_away_while_every_place_is_taken_use_up_no_rate() {
+        let (exchanger, _dir) = exchanger(1);
+        let held: Vec<_> = (0..UNPROVEN_CONCURRENCY)
+            .map(|_| exchanger.admit_unproven().expect("a place"))
+            .collect();
+        // Far more than the burst: each is turned away for want of a place.
+        for _ in 0..(UNPROVEN_PER_SECOND as usize * 10) {
+            assert!(matches!(
+                exchanger.admit_unproven(),
+                Err(ExchangeError::Busy)
+            ));
+        }
+        drop(held);
+        // The rate is still there for the next one.
+        assert!(exchanger.admit_unproven().is_ok());
     }
 
     #[test]

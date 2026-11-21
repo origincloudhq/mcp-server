@@ -1,7 +1,12 @@
 //! The SDK clients the tools call the API through: one per caller, holding
 //! the caller's latest token and the consistency token of the caller's
-//! writes, so that a read sees what the caller wrote before, from any of the
-//! caller's connections to this server.
+//! writes, so that a read sees what the caller wrote before.
+//!
+//! A person is one caller across all their tokens and connections: each of
+//! the realm's tokens stands for the same person, acting through this
+//! server. A zone STS's token is a caller of its own: two of one service
+//! account's tokens may have come from different CI jobs or keys, which the
+//! API checks and records per token, so neither may call with the other's.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -11,7 +16,9 @@ use std::time::{Duration, Instant};
 use origincloud_core::credentials::TokenFuture;
 use origincloud_core::{Client, Credentials};
 
-use crate::auth::Caller;
+use sha2::{Digest, Sha256};
+
+use crate::auth::{Caller, Proof};
 use crate::exchange::Exchanger;
 
 /// How long a caller's client is kept after its last call.
@@ -35,7 +42,29 @@ pub struct Registry {
     api: Api,
     exchanger: Arc<Exchanger>,
     http: reqwest::Client,
-    callers: Mutex<HashMap<(String, String), Held>>,
+    callers: Mutex<HashMap<Key, Held>>,
+}
+
+/// Whose client a request uses: the token's issuer and subject, and for a
+/// zone STS's token the token itself (its SHA-256).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Key {
+    issuer: String,
+    subject: String,
+    token: Option<[u8; 32]>,
+}
+
+impl Key {
+    fn of(caller: &Caller) -> Self {
+        // A zone STS's tokens are the ones the STS checks (`Proof::Exchange`).
+        let token = (caller.proof == Proof::Exchange)
+            .then(|| Sha256::digest(caller.token.as_bytes()).into());
+        Self {
+            issuer: caller.issuer.clone(),
+            subject: caller.subject.clone(),
+            token,
+        }
+    }
 }
 
 struct Held {
@@ -58,7 +87,7 @@ impl Registry {
     pub fn client(&self, caller: &Caller) -> Result<Client, origincloud_core::Error> {
         let now = Instant::now();
         let mut callers = self.callers.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (caller.issuer.clone(), caller.subject.clone());
+        let key = Key::of(caller);
         if let Some(held) = callers.get_mut(&key) {
             held.credentials.present(caller);
             held.used = now;
@@ -116,8 +145,8 @@ struct CallerCredentials {
 impl CallerCredentials {
     /// Presents `caller`'s token from now on, unless the one held lives
     /// longer: a request that arrives late with an older token mustn't
-    /// replace the newer one. All of them are the same issuer's and
-    /// subject's.
+    /// replace the newer one. All of them are the same [`Key`]'s: one
+    /// person's tokens, or one STS token.
     fn present(&self, caller: &Caller) {
         let mut held = self.caller.lock().unwrap_or_else(|e| e.into_inner());
         if caller.expires_at >= held.expires_at {

@@ -196,6 +196,50 @@ async fn a_service_account_s_sts_token_is_served() {
     assert_eq!(h.sts.exchanges().len(), 1);
 }
 
+/// Two STS tokens of one service account (two CI jobs, say) are two
+/// callers: each one's tool calls reach the API with the token exchanged for
+/// its own, never the other's, whichever lives longer.
+#[tokio::test]
+async fn two_sts_tokens_of_one_account_each_call_with_their_own() {
+    let h = Harness::start(pvs).await;
+    let account = "//iam.example/organizations/o/serviceAccounts/sa-1";
+    let first = h.sts.token(
+        ZONE,
+        json!({ "sub": account, "aud": [h.url.clone()], "jti": "job-a", "exp": now() + 600 }),
+    );
+    let second = h.sts.token(
+        ZONE,
+        json!({ "sub": account, "aud": [h.url.clone()], "jti": "job-b", "exp": now() + 900 }),
+    );
+    let a = h.connect(&first, "").await;
+    let b = h.connect(&second, "").await;
+
+    // The second lives longer, and is presented after the first.
+    b.call("pvs_get_volume", json!({ "name": VOLUME })).await;
+    a.call("pvs_get_volume", json!({ "name": VOLUME })).await;
+
+    let tokens: Vec<_> = h
+        .api
+        .received()
+        .iter()
+        .map(|r| r.header("authorization").unwrap_or_default().to_owned())
+        .collect();
+    let exchanged_for = |subject_token: &str| {
+        let n = h
+            .sts
+            .exchanges()
+            .iter()
+            .position(|e| {
+                form(e)
+                    .iter()
+                    .any(|(k, v)| k == "subject_token" && v == subject_token)
+            })
+            .expect("exchanged");
+        format!("Bearer exchanged-{account}-{}", n + 1)
+    };
+    assert_eq!(tokens, [exchanged_for(&second), exchanged_for(&first)]);
+}
+
 /// What the STS is sent: the caller's token as subject, the server's
 /// workload assertion as actor, and nothing else.
 #[tokio::test]
@@ -823,6 +867,39 @@ async fn an_error_that_is_not_about_the_token_is_not_a_refusal() {
         assert_eq!(h.post("", Some(&bearer(&token))).await.status(), 401);
     }
     assert_eq!(h.sts.exchanges().len(), before + 1);
+}
+
+/// The STS not accepting this server's own proof (a key that isn't its
+/// certificate's, say) is this server's fault, not the caller's: `503`, and
+/// asked again, never `401`, which would send every client to sign in again.
+#[tokio::test]
+async fn a_refused_actor_is_unavailable_not_a_refusal_of_the_caller() {
+    use p256::pkcs8::{EncodePrivateKey, LineEnding};
+    let h = Harness::start(pvs).await;
+    let token = h
+        .sts
+        .token(ZONE, json!({ "sub": "sa", "aud": [h.url.clone()] }));
+    // The server signs with a key the STS doesn't know it by.
+    let other = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+    std::fs::write(
+        h.workload.dir.path().join("workload.key"),
+        other.to_pkcs8_pem(LineEnding::LF).unwrap(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let response = h.post("", Some(&bearer(&token))).await;
+        assert_eq!(response.status(), 503);
+        assert!(header(&response, "www-authenticate").is_empty());
+    }
+    assert_eq!(h.sts.exchanges().len(), 2, "the refusal was remembered");
+    // A person's tool call fails without blaming the person's token.
+    let agent = h.connect(&h.token_for("alice"), "").await;
+    let read = agent
+        .call("pvs_get_volume", json!({ "name": VOLUME }))
+        .await;
+    assert_eq!(read.is_error, Some(true));
+    assert!(!format!("{read:?}").contains("refused"), "{read:?}");
+    assert!(h.api.received().is_empty());
 }
 
 /// A token that isn't valid yet may be taken a moment later: its refusal
