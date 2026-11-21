@@ -21,6 +21,7 @@ origincloud-core = { git = "https://github.com/origincloudhq/sdk-rust", rev = "7
 
 anyhow = "1"
 axum = "0.8"
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 http = "1"
 jsonwebtoken = "9"
@@ -31,7 +32,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tokio-util = "0.7"
 tower-http = { version = "0.6", features = ["cors", "request-id", "util"] }
 tracing = "0.1"
@@ -40,9 +41,10 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-base64 = "0.22"
 # The SDK's fake API, at the same commit as the SDK.
 fake-server = { git = "https://github.com/origincloudhq/sdk-rust", rev = "79f3007ad54cbb7de18270dcca44f516edfdf969" }
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 rmcp = { version = "3", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+tempfile = "3"

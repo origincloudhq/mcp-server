@@ -12,7 +12,7 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use clap::Parser;
 use fake_server::{FakeServer, Received, Response};
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use origincloud_mcp_server::config::Config;
 use origincloud_mcp_server::Server;
 use p256::ecdsa::SigningKey;
@@ -25,27 +25,26 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
-/// The exchange client's credentials the server is configured with.
-pub const CLIENT_ID: &str = "mcp-server-test";
-pub const CLIENT_SECRET: &str = "exchange-secret";
-/// The audience the fake API's tokens are exchanged for.
-pub const API_AUDIENCE: &str = "account";
+/// The audience of the tokens the API takes: not the server's.
+pub const API_AUDIENCE: &str = "origincloud:api";
+/// The zone of the fake STS, and the workload the server is to it.
+pub const ZONE: &str = "test-zone-1";
+pub const WORKLOAD_ID: &str = "spiffe://test.example/workload/mcp-server";
 
-/// The fake authorization server: an OpenID configuration, its key set and
-/// a token endpoint that exchanges any token of its own for
-/// `exchanged-{sub}-{n}`, recording each exchange.
+/// The fake Keycloak realm: an OpenID configuration and its key set.
 pub struct Issuer {
     server: FakeServer,
     id: Arc<OnceLock<String>>,
+    /// How often the key set was fetched.
+    pub key_fetches: Arc<AtomicUsize>,
     key: EncodingKey,
     /// A key of the same id that isn't in the key set.
     impostor: EncodingKey,
-    pub exchanges: Arc<Mutex<Vec<Received>>>,
-    /// Makes the token endpoint refuse every exchange.
-    pub refuse: Arc<AtomicBool>,
+    jwk: Value,
 }
 
-fn key_pair() -> (EncodingKey, Value) {
+/// A fresh ES256 key: its PEM, its encoding key and its public JWK.
+fn key_pair() -> (String, EncodingKey, Value) {
     let key = SigningKey::random(&mut rand_core::OsRng);
     let pem = key.to_pkcs8_pem(LineEnding::LF).expect("a PEM");
     let point = key.verifying_key().to_encoded_point(false);
@@ -59,8 +58,23 @@ fn key_pair() -> (EncodingKey, Value) {
         "y": URL_SAFE_NO_PAD.encode(point.y().expect("y")),
     });
     (
+        pem.to_string(),
         EncodingKey::from_ec_pem(pem.as_bytes()).expect("an EC key"),
         jwk,
+    )
+}
+
+/// The user id of a person known by `name` in a test: `name` itself when it
+/// is one already.
+pub fn person_id(name: &str) -> String {
+    if uuid::Uuid::parse_str(name).is_ok() {
+        return name.to_owned();
+    }
+    let sum: u64 = name.bytes().fold(7, |a, b| a * 31 + u64::from(b));
+    format!(
+        "{:08x}-0000-4000-8000-{:012x}",
+        sum as u32,
+        (sum >> 8) & 0xffff_ffff_ffff
     )
 }
 
@@ -79,14 +93,12 @@ pub fn now() -> u64 {
 
 impl Issuer {
     pub async fn start() -> Self {
-        let (key, jwk) = key_pair();
-        let (impostor, _) = key_pair();
+        let (_, key, jwk) = key_pair();
+        let (_, impostor, _) = key_pair();
         let id: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
-        let exchanges = Arc::new(Mutex::new(Vec::new()));
-        let refuse = Arc::new(AtomicBool::new(false));
-        let count = Arc::new(AtomicUsize::new(0));
-        let (seen, issuer, refusing) =
-            (Arc::clone(&exchanges), Arc::clone(&id), Arc::clone(&refuse));
+        let (issuer, published) = (Arc::clone(&id), jwk.clone());
+        let key_fetches = Arc::new(AtomicUsize::new(0));
+        let fetches = Arc::clone(&key_fetches);
         let server = FakeServer::start(move |r: Received| {
             let issuer = issuer.get().cloned().unwrap_or_default();
             let response = match (r.method.as_str(), r.path.as_str()) {
@@ -94,17 +106,12 @@ impl Issuer {
                     json!({
                         "issuer": issuer,
                         "jwks_uri": format!("{issuer}/protocol/openid-connect/certs"),
-                        "token_endpoint": format!("{issuer}/protocol/openid-connect/token"),
                     })
                     .to_string(),
                 ),
                 ("GET", "/realms/test/protocol/openid-connect/certs") => {
-                    Response::json(json!({ "keys": [jwk] }).to_string())
-                }
-                ("POST", "/realms/test/protocol/openid-connect/token") => {
-                    let answer = exchange(&r, &count, refusing.load(Ordering::SeqCst));
-                    seen.lock().unwrap().push(r.clone());
-                    answer
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    Response::json(json!({ "keys": [published] }).to_string())
                 }
                 _ => Response::json("{}").with_status(404),
             };
@@ -115,16 +122,21 @@ impl Issuer {
         Self {
             server,
             id,
+            key_fetches,
             key,
             impostor,
-            exchanges,
-            refuse,
+            jwk,
         }
     }
 
     /// The issuer identifier.
     pub fn id(&self) -> String {
         self.id.get().unwrap().clone()
+    }
+
+    /// The public key a token of this realm is checked with.
+    pub fn public_key(&self) -> Value {
+        self.jwk.clone()
     }
 
     /// A token of `claims`, completed with the issuer and a lifetime
@@ -140,22 +152,218 @@ impl Issuer {
         jsonwebtoken::encode(&header, &claims, &self.key).expect("a token")
     }
 
+    /// A token of exactly `claims` with a header of the caller's making.
+    pub fn token_without_defaults_with(&self, header: &Header, claims: Value) -> String {
+        jsonwebtoken::encode(header, &claims, &self.key).expect("a token")
+    }
+
     /// The same, signed with a key the issuer doesn't publish.
     pub fn forged(&self, claims: Value) -> String {
         self.sign(&self.impostor, claims)
     }
 
     fn sign(&self, key: &EncodingKey, mut claims: Value) -> String {
-        let defaults =
-            json!({ "iss": self.id(), "iat": now(), "exp": now() + 300, "azp": "origincloud-mcp" });
+        let defaults = json!({
+            "iss": self.id(), "iat": now(), "exp": now() + 300, "azp": "origincloud-mcp",
+            "typ": "Bearer", "email": "person@example.com", "email_verified": true,
+            "name": "A Person", "given_name": "A", "family_name": "Person",
+        });
         for (k, v) in defaults.as_object().unwrap() {
             if claims.get(k).is_none() {
                 claims[k] = v.clone();
             }
         }
+        // A person is named by a user id, a UUID: a short name is mapped to one.
+        if let Some(sub) = claims["sub"].as_str() {
+            claims["sub"] = person_id(sub).into();
+        }
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some("key-1".to_owned());
         jsonwebtoken::encode(&header, &claims, key).expect("a token")
+    }
+}
+
+/// The server's workload certificate in a directory, as the enrolment client
+/// keeps it, and its public key. The certificates are placeholders: only
+/// the key is used.
+pub struct WorkloadFiles {
+    pub dir: tempfile::TempDir,
+    pub public_key: Value,
+}
+
+impl WorkloadFiles {
+    pub fn new() -> Self {
+        let (pem, _, jwk) = key_pair();
+        let dir = tempfile::tempdir().unwrap();
+        let certificate = |name: &str, body: &[u8]| {
+            let pem = format!(
+                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                STANDARD.encode(body)
+            );
+            std::fs::write(dir.path().join(name), pem).unwrap();
+        };
+        std::fs::write(dir.path().join("workload.key"), pem).unwrap();
+        certificate("workload.crt", b"the workload's certificate");
+        certificate("chain.crt", b"the zone's intermediate");
+        certificate("root.crt", b"the region's root");
+        Self {
+            dir,
+            public_key: jwk,
+        }
+    }
+}
+
+/// The fake STS: `POST /v1/token`, RFC 8693. It checks what the real one
+/// does of the actor (the assertion's signature by the workload's key, its
+/// issuer, subject, audience and lifetime, a chain of three certificates)
+/// and of the subject (the signature, by the realm's key or its own), and
+/// answers `exchanged-{sub}-{n}`, recording each request.
+pub struct Sts {
+    server: FakeServer,
+    key: EncodingKey,
+    impostor: EncodingKey,
+    pub exchanges: Arc<Mutex<Vec<Received>>>,
+    /// Makes the token endpoint refuse every exchange.
+    pub refuse: Arc<AtomicBool>,
+    /// Makes it answer `503`.
+    pub unavailable: Arc<AtomicBool>,
+    /// The error a refusal answers with (`400`).
+    pub error: Arc<Mutex<String>>,
+    /// How long an exchange takes, in milliseconds.
+    pub delay_ms: Arc<AtomicUsize>,
+}
+
+/// A fresh Ed25519 key as the STS signs with: its encoding key and the
+/// public key's base64url.
+fn ed_key_pair() -> (EncodingKey, String) {
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
+    let key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let der = key.to_pkcs8_der().expect("a DER");
+    (
+        EncodingKey::from_ed_der(der.as_bytes()),
+        URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()),
+    )
+}
+
+/// The key id the fake STS names in its tokens, as the real one does.
+pub const STS_KID: &str = "sts-key-1";
+
+fn components(jwk: &Value) -> DecodingKey {
+    DecodingKey::from_ec_components(jwk["x"].as_str().unwrap(), jwk["y"].as_str().unwrap())
+        .expect("a public key")
+}
+
+/// Whether `token`'s signature is `key`'s, whatever its claims say.
+fn signed_by(token: &str, key: &DecodingKey, alg: Algorithm) -> bool {
+    let mut validation = Validation::new(alg);
+    validation.validate_aud = false;
+    validation.validate_exp = false;
+    validation.required_spec_claims.clear();
+    jsonwebtoken::decode::<Value>(token, key, &validation).is_ok()
+}
+
+impl Sts {
+    pub async fn start(realm: Value, workload: Value) -> Self {
+        let (key, public) = ed_key_pair();
+        let (impostor, _) = ed_key_pair();
+        let exchanges = Arc::new(Mutex::new(Vec::new()));
+        let refuse = Arc::new(AtomicBool::new(false));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new("invalid_grant".to_owned()));
+        let delay_ms = Arc::new(AtomicUsize::new(0));
+        let count = Arc::new(AtomicUsize::new(0));
+        let (seen, refusing, down, code, delay) = (
+            Arc::clone(&exchanges),
+            Arc::clone(&refuse),
+            Arc::clone(&unavailable),
+            Arc::clone(&error),
+            Arc::clone(&delay_ms),
+        );
+        let server = FakeServer::start(move |r: Received| {
+            let response = if (r.method.as_str(), r.path.as_str()) != ("POST", "/v1/token") {
+                Response::json("{}").with_status(404)
+            } else {
+                seen.lock().unwrap().push(r.clone());
+                if down.load(Ordering::SeqCst) {
+                    Response::json(json!({ "error": "temporarily_unavailable" }).to_string())
+                        .with_status(503)
+                } else {
+                    let code = code.lock().unwrap().clone();
+                    exchange(
+                        &r,
+                        &count,
+                        refusing.load(Ordering::SeqCst),
+                        &realm,
+                        &workload,
+                        &public,
+                        &code,
+                    )
+                }
+            };
+            let wait = delay.load(Ordering::SeqCst) as u64;
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                response
+            }
+        })
+        .await;
+        Self {
+            server,
+            key,
+            impostor,
+            exchanges,
+            refuse,
+            unavailable,
+            error,
+            delay_ms,
+        }
+    }
+
+    pub fn url(&self) -> String {
+        self.server.url()
+    }
+
+    fn complete(zone: &str, mut claims: Value) -> Value {
+        let defaults = json!({
+            "iss": format!("origincloud:sts:{zone}"),
+            "iat": now(),
+            "nbf": now(),
+            "exp": now() + 300,
+        });
+        for (k, v) in defaults.as_object().unwrap() {
+            if claims.get(k).is_none() {
+                claims[k] = v.clone();
+            }
+        }
+        claims
+    }
+
+    /// A token of this STS's zone `zone`, of `claims` completed with the
+    /// issuer and a lifetime unless they name their own, signed EdDSA with
+    /// a named key as the real STS does.
+    pub fn token(&self, zone: &str, claims: Value) -> String {
+        self.sign(&self.key, zone, claims)
+    }
+
+    /// The same, signed with a key this STS doesn't hold.
+    pub fn forged(&self, zone: &str, claims: Value) -> String {
+        self.sign(&self.impostor, zone, claims)
+    }
+
+    fn sign(&self, key: &EncodingKey, zone: &str, claims: Value) -> String {
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(STS_KID.to_owned());
+        jsonwebtoken::encode(&header, &Self::complete(zone, claims), key).expect("a token")
+    }
+
+    /// A token with a header of the caller's making, signed with whichever
+    /// key suits `header.alg`.
+    pub fn token_with(&self, header: &Header, zone: &str, claims: Value) -> String {
+        let key = match header.alg {
+            Algorithm::EdDSA => self.key.clone(),
+            _ => key_pair().1,
+        };
+        jsonwebtoken::encode(header, &Self::complete(zone, claims), &key).expect("a token")
     }
 
     pub fn exchanges(&self) -> Vec<Received> {
@@ -163,17 +371,26 @@ impl Issuer {
     }
 }
 
-/// The token endpoint: checks the client's credentials and the grant, and
-/// answers with a token naming the subject token's `sub`.
-fn exchange(r: &Received, count: &AtomicUsize, refuse: bool) -> Response {
-    let basic = format!(
-        "Basic {}",
-        STANDARD.encode(format!("{CLIENT_ID}:{CLIENT_SECRET}"))
-    );
-    if r.header("authorization") != Some(basic.as_str()) {
-        return Response::json(json!({ "error": "invalid_client" }).to_string()).with_status(401);
-    }
-    let form: Vec<(String, String)> = url::form_urlencoded::parse(&r.body).into_owned().collect();
+/// The form of an exchange.
+pub fn form(r: &Received) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(&r.body).into_owned().collect()
+}
+
+fn exchange(
+    r: &Received,
+    count: &AtomicUsize,
+    refuse: bool,
+    realm: &Value,
+    workload: &Value,
+    sts: &str,
+    error: &str,
+) -> Response {
+    let invalid_grant = || Response::json(json!({ "error": error }).to_string()).with_status(400);
+    // The actor's assertion not accepted: the acting client failed to
+    // authenticate (RFC 6749, section 5.2), as the real STS answers it.
+    let invalid_client =
+        || Response::json(json!({ "error": "invalid_client" }).to_string()).with_status(401);
+    let form = form(r);
     let get = |k: &str| {
         form.iter()
             .find(|(key, _)| key == k)
@@ -181,19 +398,55 @@ fn exchange(r: &Received, count: &AtomicUsize, refuse: bool) -> Response {
     };
     if refuse
         || get("grant_type").as_deref() != Some("urn:ietf:params:oauth:grant-type:token-exchange")
+        || get("actor_token_type").as_deref()
+            != Some("urn:origincloud:params:oauth:token-type:workload-assertion")
     {
-        return Response::json(
-            json!({ "error": "access_denied", "error_description": "Client not allowed to exchange" })
-                .to_string(),
-        )
-        .with_status(400);
+        return invalid_grant();
     }
-    let subject =
-        get("subject_token").map(|t| claims(&t)["sub"].as_str().unwrap_or_default().to_owned());
+    let (Some(subject), Some(actor)) = (get("subject_token"), get("actor_token")) else {
+        return invalid_grant();
+    };
+    // The actor: the workload's assertion for this zone's STS.
+    let header = jsonwebtoken::decode_header(&actor).expect("a JWS header");
+    assert_eq!(header.alg, Algorithm::ES256);
+    assert_eq!(header.x5c.as_ref().map(Vec::len), Some(3), "the chain");
+    let mut validation = Validation::new(Algorithm::ES256);
+    validation.set_audience(&[format!("origincloud:sts:{ZONE}")]);
+    validation.set_issuer(&[WORKLOAD_ID]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    let Ok(asserted) = jsonwebtoken::decode::<Value>(&actor, &components(workload), &validation)
+    else {
+        return invalid_client();
+    };
+    let a = asserted.claims;
+    if a["sub"] != WORKLOAD_ID
+        || a["exp"].as_u64().unwrap() - a["iat"].as_u64().unwrap() > 60
+        || a["jti"].as_str().is_none_or(str::is_empty)
+    {
+        return invalid_client();
+    }
+    // The subject: signed by the realm, or by this STS.
+    let sub = claims(&subject);
+    let signed = if sub["iss"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("origincloud:sts:")
+    {
+        signed_by(
+            &subject,
+            &DecodingKey::from_ed_components(sts).unwrap(),
+            Algorithm::EdDSA,
+        )
+    } else {
+        signed_by(&subject, &components(realm), Algorithm::ES256)
+    };
+    if !signed {
+        return invalid_grant();
+    }
     let n = count.fetch_add(1, Ordering::SeqCst) + 1;
     Response::json(
         json!({
-            "access_token": format!("exchanged-{}-{n}", subject.unwrap_or_default()),
+            "access_token": format!("exchanged-{}-{n}", sub["sub"].as_str().unwrap_or_default()),
             "expires_in": 300,
             "token_type": "Bearer",
             "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
@@ -229,7 +482,9 @@ impl Api {
 /// The server between the two fakes.
 pub struct Harness {
     pub issuer: Issuer,
+    pub sts: Sts,
     pub api: Api,
+    pub workload: WorkloadFiles,
     /// The server's canonical URI, `http://127.0.0.1:{port}`.
     pub url: String,
     pub metrics_url: String,
@@ -246,30 +501,46 @@ impl Drop for Harness {
 
 impl Harness {
     pub async fn start(answer: impl Fn(&Received) -> Response + Send + Sync + 'static) -> Self {
+        Self::start_with(answer, &[]).await
+    }
+
+    /// The server with more flags.
+    pub async fn start_with(
+        answer: impl Fn(&Received) -> Response + Send + Sync + 'static,
+        flags: &[&str],
+    ) -> Self {
         let issuer = Issuer::start().await;
+        let workload = WorkloadFiles::new();
+        let sts = Sts::start(issuer.public_key(), workload.public_key.clone()).await;
         let api = Api::start(answer).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let metrics = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let metrics_url = format!("http://127.0.0.1:{}", metrics.local_addr().unwrap().port());
-        let config = Config::try_parse_from([
+        let (issuer_id, api_url) = (issuer.id(), api.server.url());
+        let sts_url = sts.url();
+        let workload_dir = workload.dir.path().to_string_lossy().into_owned();
+        let mut args = vec![
             "origincloud-mcp-server",
             "--resource",
             &url,
             "--issuer",
-            &issuer.id(),
-            "--exchange-client-id",
-            CLIENT_ID,
-            "--exchange-client-secret",
-            CLIENT_SECRET,
-            "--api-audience",
-            API_AUDIENCE,
+            &issuer_id,
+            "--sts-url",
+            &sts_url,
+            "--sts-zone",
+            ZONE,
+            "--workload-dir",
+            &workload_dir,
+            "--workload-id",
+            WORKLOAD_ID,
             "--api-endpoint",
-            &api.server.url(),
+            &api_url,
             "--drain-seconds",
             "1",
-        ])
-        .unwrap();
+        ];
+        args.extend_from_slice(flags);
+        let config = Config::try_parse_from(args).unwrap();
         let server = Server::new(config).unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(server.run(listener, metrics, async move {
@@ -277,7 +548,9 @@ impl Harness {
         }));
         Self {
             issuer,
+            sts,
             api,
+            workload,
             url,
             metrics_url,
             stop: Some(stop),

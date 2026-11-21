@@ -29,14 +29,16 @@ scripts/*.sh`, and the image build.
 - `src/lib.rs` is the server: the MCP endpoint, the protected resource
   metadata, and the stop on a termination signal. `src/main.rs` reads the
   configuration (`src/config.rs`) and runs it.
-- `src/auth/` checks bearer tokens against the issuer's keys and builds the
-  `WWW-Authenticate` challenge; `src/exchange.rs` exchanges a caller's token
-  for one the API accepts, and keeps it until it is due.
+- `src/auth/` checks bearer tokens (the realm's against its keys, a zone
+  STS's by claims, the STS checking the signature) and builds the
+  `WWW-Authenticate` challenge; `src/exchange.rs` has the STS exchange a
+  caller's token for one the API accepts, and keeps it until it is due;
+  `src/workload.rs` makes the assertion that proves the server to the STS.
 - `src/clients.rs` holds each caller's SDK client; `src/session.rs` serves
   one request with the library's server, its tool calls going through the
   caller's client.
 - `src/options.rs` reads a connection's options from the URL's query.
-- `tests/end_to_end.rs` runs the server between a fake authorization server
+- `tests/end_to_end.rs` runs the server between a fake realm, a fake STS
   and the SDK's fake API (`tests/common/`), through an MCP client.
 
 The server has no tools of its own. A method added to the API reaches it

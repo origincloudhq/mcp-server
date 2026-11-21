@@ -17,7 +17,8 @@ adds only the transport and the authorization.
 Add the server to your MCP client by its URL. Origin Cloud's login doesn't
 register clients on the fly: an MCP client logs in as the public client
 `origincloud-mcp`, which accepts the redirect `http://localhost:33418/callback`.
-In Claude Code:
+(The server accepts a token of any client, so a client that registers itself
+works as well.) In Claude Code:
 
 ```sh
 claude mcp add --transport http --client-id origincloud-mcp --callback-port 33418 \
@@ -55,28 +56,75 @@ requires:
 2. The metadata, at `/.well-known/oauth-protected-resource`, names the
    server's canonical URI as its `resource` and Origin Cloud's identity
    provider as its authorization server, where the client logs in.
-3. The server accepts a token only if it is a JWT signed with a key of the
-   issuer's JWKS (fetched from its OpenID configuration, kept for ten
-   minutes, fetched again for a key it doesn't know), issued by the issuer,
-   for the server's own audience, and in its lifetime.
-4. The token must also have been issued to the client people sign in to
-   the server with, `origincloud-mcp` (its `azp`). Any other valid token,
-   such as a service account's, is answered `403` with
-   `WWW-Authenticate: Bearer error="insufficient_scope"`, before it is ever
-   exchanged: the token is valid, but doesn't carry what this server needs
-   (RFC 6750, section 3.1). No `scope` is named, since no scope a service
-   account could request would make its token acceptable.
-5. A tool call reaches the API with an access token the server obtains by
-   token exchange (RFC 8693) at the issuer: the caller's token as the
-   subject, the server's own confidential client as the requester, the
-   API's audience as the target. The exchanged token is kept until shortly
-   before it expires, and never past the caller's token. The caller's token
-   is never sent anywhere but to the issuer.
+3. The server accepts a token only if it was issued for the server's own
+   audience, is in its lifetime, and comes from a trusted issuer:
+   - **The realm people sign in at.** The token must be a JWT signed with a
+     key of the realm's JWKS (fetched from its OpenID configuration, kept
+     for ten minutes, fetched again for a key it doesn't know) and issued by
+     the realm. Any client's token is accepted, if it is a person's access
+     token as the STS requires it (type `Bearer`, a user id as the subject,
+     and the `email`, `email_verified`, `name`, `given_name` and
+     `family_name` claims): anything else is refused early.
+   - **A zone's security token service (STS)**, whose tokens name it as
+     `origincloud:sts:<zone>`, such as a service account's token for this
+     server's audience. Its issuer, audience and lifetime are checked here;
+     its signature is checked by the STS itself when the server exchanges the
+     token (see 5), which the server does before it serves the request: a
+     token the STS doesn't accept is refused with `401`. The STS signs EdDSA
+     and names its key, so a token that doesn't is refused without asking it.
+     Such exchanges of tokens nobody has checked are limited (a few at once,
+     a few dozen a second); past the limit the request is answered `503` with
+     `Retry-After`, counted as `unavailable`. A token the STS accepted once,
+     and a realm's token, aren't limited.
 
-The hosted server is for people signing in through their MCP client. An
-agent running as a service account runs `origin mcp serve` of the
+   A token is refused if it is longer than 16 KiB, expired, or expires more
+   than seven days ahead.
+
+   A token of any other issuer is refused. `--allowed-clients` optionally
+   restricts the server to tokens issued to some clients (`azp`); it is empty
+   by default. A token of another client, or one that names none, such as an
+   STS's, is then answered `403` with
+   `WWW-Authenticate: Bearer error="insufficient_scope"` (RFC 6750, section
+   3.1), before it is ever exchanged.
+4. A refused token is counted by reason in
+   `origincloud_mcp_auth_refusals_total{reason}`.
+5. A tool call reaches the API with an access token the STS issues by token
+   exchange (RFC 8693): the caller's token as the `subject_token`, and this
+   server's own credential as the `actor_token`, an assertion signed with the
+   server's workload certificate of the zone's certificate authority (see
+   below). The issued token keeps the caller as its subject and names this
+   server as the party acting for them (`act`). It is kept until shortly
+   before it expires, and never past the caller's token; a token the STS
+   refused (`invalid_grant`, and nothing else) isn't asked about again for
+   thirty seconds, unless it isn't valid yet; callers presenting the same
+   token at once share one exchange. Any other error of the STS (`invalid_request`,
+   `invalid_client`, `invalid_target`, ...) is this server's own fault, not
+   the token's: it is logged as an error, answered `503`, and not remembered.
+   Callers of a tool are told no more than that the token couldn't be
+   exchanged; the detail is in the logs. The caller's token is
+   never sent anywhere but to the STS that exchanges it.
+
+The hosted server is for people signing in through their MCP client, and for
+service accounts that obtain a token for this server's audience. An agent that
+can't reach it runs `origin mcp serve` of the
 [`origin` CLI](https://github.com/origincloudhq/cli) with the account's own
 credentials instead, which serves the same tools on its machine.
+
+### The server's credential for the STS
+
+The server proves itself to the STS with the workload certificate its pod holds
+from the zone's certificate authority. A directory (`--workload-dir`) holds
+what the enrolment client keeps: `workload.key` (PKCS#8 PEM), `workload.crt`,
+`chain.crt` (the intermediate) and `root.crt`. For each exchange the server
+signs a one-minute assertion with that key (ES256; the certificate, the
+intermediate and the root in `x5c`; the workload's SPIFFE id, `--workload-id`,
+as issuer and subject; the STS of `--sts-zone` as audience; issued five
+seconds before it is made, so that a clock a little behind doesn't refuse it). The STS takes only
+the one workload it is configured with, and only while the authority lists its
+certificate as live. The files are read for every assertion, so a renewed
+certificate is used at once, and the key never leaves the process. Without the
+files the server can't exchange: tool calls fail, and a token that needs the
+STS is answered `503`.
 
 The server keeps no MCP sessions: each request is answered on its own, so
 that any replica can answer any request. Each caller's SDK client is kept
@@ -85,7 +133,8 @@ across requests, so that a read shows the caller's earlier writes.
 ## Running it
 
 ```sh
-cargo run -- --exchange-client-secret "$SECRET"
+cargo run -- --sts-url https://sts.example.com --sts-zone zone-1 \
+  --workload-dir /path/to/workload --workload-id spiffe://example.com/mcp-server
 ```
 
 Every flag can be set by an environment variable instead; `--help` lists
@@ -97,12 +146,14 @@ them. The defaults are Origin Cloud's production values.
 | `--metrics-listen` | `MCP_METRICS_LISTEN_ADDRESS` | `0.0.0.0:9090` | `/metrics`, `/healthz`, `/readyz` |
 | `--resource` | `MCP_RESOURCE` | `https://mcp.origincloudapis.eu` | The canonical URI; the MCP endpoint is its path |
 | `--audience` | `MCP_AUDIENCE` | the canonical URI | The audience a token must carry |
-| `--issuer` | `MCP_ISSUER` | `https://auth.origincloud.eu/realms/origincloud` | The authorization server |
+| `--issuer` | `MCP_ISSUER` | `https://auth.origincloud.eu/realms/origincloud` | The realm people sign in at, the authorization server clients log in to |
 | `--scopes` | `MCP_SCOPES` | `mcp` | The scopes a client requests, space-separated |
-| `--allowed-clients` | `MCP_ALLOWED_CLIENTS` | `origincloud-mcp` | The clients a token must have been issued to, comma-separated |
-| `--exchange-client-id` | `MCP_EXCHANGE_CLIENT_ID` | `origincloud-mcp-server` | The client the server exchanges tokens as |
-| `--exchange-client-secret` | `MCP_EXCHANGE_CLIENT_SECRET` | none, required | Its secret |
-| `--api-audience` | `MCP_API_AUDIENCE` | `account` | The audience of an exchanged token |
+| `--allowed-clients` | `MCP_ALLOWED_CLIENTS` | none | Restricts the server to tokens issued to these clients, comma-separated; any client's token otherwise |
+| `--sts-url` | `MCP_STS_URL` | none, required | The base URL of the STS that exchanges tokens, as its zone's workloads reach it; `https`. Its host must be the STS's internal name: the STS decides by the request's `Host` whether it takes an actor's exchange, and refuses it on its public name |
+| `--sts-zone` | `MCP_STS_ZONE` | none, required | The zone of that STS |
+| `--sts-ca-file` | `MCP_STS_CA_FILE` | none | PEM certificates that are the only trust for the STS's name |
+| `--workload-dir` | `MCP_WORKLOAD_DIR` | none, required | The directory of the server's workload certificate |
+| `--workload-id` | `MCP_WORKLOAD_ID` | none, required | The workload's SPIFFE id |
 | `--api-region` | `MCP_API_REGION` | none | The region whose front door the calls go to |
 | `--api-endpoint` | `MCP_API_ENDPOINT` | none | One endpoint for every service, such as a fake API |
 | `--allowed-hosts` | `MCP_ALLOWED_HOSTS` | none | More `Host` values to answer than the canonical URI's |
@@ -125,7 +176,7 @@ and run as a user without privileges.
   `origincloud_mcp_auth_refusals_total{reason}` (`missing`, `invalid`, `client`,
   `unavailable`) and `origincloud_build_info`.
 - **Health:** `/healthz` answers while the process runs; `/readyz` once the
-  issuer's configuration has been read, and until a termination signal.
+  realm's configuration has been read, and until a termination signal.
 
 ## Contributing
 
