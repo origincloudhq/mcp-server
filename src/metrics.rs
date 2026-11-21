@@ -11,7 +11,8 @@
 //!   `error` (the tool's error, such as the API's refusal) or
 //!   `protocol_error`.
 //! - `origincloud_mcp_token_exchanges_total{outcome}`: `exchanged`,
-//!   `cached` (a token exchanged before was used) or `failed`.
+//!   `cached` (a token exchanged before was used), `failed`, or `busy` (not
+//!   attempted: too many tokens nobody has checked were being exchanged).
 //! - `origincloud_mcp_auth_refusals_total{reason}`: requests refused for
 //!   their token: `missing`, `invalid`, `client` (a valid token of a client
 //!   the server is restricted from, `--allowed-clients`) or `unavailable`

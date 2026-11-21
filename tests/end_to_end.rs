@@ -901,6 +901,16 @@ async fn exchanges_of_unchecked_tokens_are_limited() {
     }
     let busy = statuses.iter().filter(|s| **s == 503).count();
     assert!(busy > 0, "nothing was limited: {statuses:?}");
+    let metrics = reqwest::get(format!("{}/metrics", h.metrics_url))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("origincloud_mcp_token_exchanges_total{outcome=\"busy\"}"),
+        "{metrics}"
+    );
     assert!(statuses.contains(&200));
     assert!(
         h.sts.exchanges().len() <= 1 + 40,

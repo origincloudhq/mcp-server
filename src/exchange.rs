@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 use url::Url;
 
 use crate::auth::{Caller, Proof};
@@ -41,6 +41,10 @@ const REFUSAL_MEMORY: Duration = Duration::from_secs(30);
 /// The most refusals remembered; past it, the oldest is forgotten for a new
 /// one.
 const MAX_REFUSALS: usize = 10_000;
+
+/// The most distinct tokens being exchanged at once; past it, a new one is
+/// answered as busy.
+const MAX_INFLIGHT: usize = 10_000;
 
 /// How many exchanges of tokens this server hasn't checked may be in flight
 /// at once, and how many it starts per second (with a burst of twice
@@ -124,6 +128,32 @@ struct Exchanged {
     proven_until: SystemTime,
 }
 
+type Flight = Arc<OnceCell<Result<Arc<str>, ExchangeError>>>;
+type Inflight = HashMap<[u8; 32], Flight>;
+
+/// A caller's place in an exchange in flight. When the last one leaves,
+/// however it does, the exchange is forgotten: a caller that is dropped
+/// mid-exchange mustn't leave its entry behind.
+struct Joined {
+    key: [u8; 32],
+    flight: Flight,
+    inflight: Arc<Mutex<Inflight>>,
+}
+
+impl Drop for Joined {
+    fn drop(&mut self) {
+        let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        // Held by the map and this caller alone: no waiter is left.
+        if Arc::strong_count(&self.flight) == 2
+            && inflight
+                .get(&self.key)
+                .is_some_and(|f| Arc::ptr_eq(f, &self.flight))
+        {
+            inflight.remove(&self.key);
+        }
+    }
+}
+
 /// A rate limit by a bucket that fills continuously.
 struct Bucket {
     tokens: f64,
@@ -142,9 +172,11 @@ pub struct Exchanger {
     cache: Mutex<HashMap<[u8; 32], Exchanged>>,
     /// The tokens the STS refused, and when that is forgotten.
     refused: Mutex<HashMap<[u8; 32], (Instant, ExchangeError)>>,
-    /// The exchanges in flight, one lock per token: callers presenting the
-    /// same token wait for the first one's exchange and take its result.
-    inflight: Mutex<HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
+    /// The exchanges in flight, one per token: callers presenting the same
+    /// token wait for the first one's exchange and take its result, failed
+    /// or not. If the caller doing the exchange goes away (its request is
+    /// dropped), the next waiter does it.
+    inflight: Arc<Mutex<Inflight>>,
     unproven: Semaphore,
     rate: Mutex<Bucket>,
 }
@@ -169,7 +201,7 @@ impl Exchanger {
             workload,
             cache: Mutex::new(HashMap::new()),
             refused: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
+            inflight: Arc::default(),
             unproven: Semaphore::new(UNPROVEN_CONCURRENCY),
             rate: Mutex::new(Bucket {
                 tokens: UNPROVEN_PER_SECOND * 2.0,
@@ -190,21 +222,30 @@ impl Exchanger {
         if let Some(found) = self.held(&key, now) {
             return found;
         }
-        let flight = {
+        let joined = {
             let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            Arc::clone(inflight.entry(key).or_default())
+            if !inflight.contains_key(&key) && inflight.len() >= MAX_INFLIGHT {
+                metrics::exchange("busy");
+                return Err(ExchangeError::Busy);
+            }
+            let flight = Arc::clone(inflight.entry(key).or_default());
+            Joined {
+                key,
+                flight,
+                inflight: Arc::clone(&self.inflight),
+            }
         };
-        let _turn = flight.lock().await;
-        let result = match self.held(&key, SystemTime::now()) {
-            // Another caller's exchange of this token finished meanwhile.
-            Some(found) => found,
-            None => self.exchange_new(&key, caller).await,
-        };
-        self.inflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&key);
-        result
+        joined
+            .flight
+            .get_or_init(|| async {
+                match self.held(&key, SystemTime::now()) {
+                    // Another flight of this token finished meanwhile.
+                    Some(found) => found,
+                    None => self.exchange_new(&key, caller).await,
+                }
+            })
+            .await
+            .clone()
     }
 
     /// What is known of `key` without asking: its exchanged token while
@@ -233,7 +274,10 @@ impl Exchanger {
                 .get(key)
                 .is_some_and(|known| known.proven_until > now);
         let _permit = if first {
-            Some(self.admit_unproven()?)
+            Some(
+                self.admit_unproven()
+                    .inspect_err(|_| metrics::exchange("busy"))?,
+            )
         } else {
             None
         };
@@ -410,5 +454,171 @@ impl Exchanger {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Exchanged>> {
         self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use p256::ecdsa::SigningKey;
+    use p256::pkcs8::{EncodePrivateKey, LineEnding};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// An exchanger for an STS at `port` of this machine, and the
+    /// certificate files it needs.
+    fn exchanger(port: u16) -> (Exchanger, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        std::fs::write(
+            dir.path().join("workload.key"),
+            key.to_pkcs8_pem(LineEnding::LF).unwrap(),
+        )
+        .unwrap();
+        for file in ["workload.crt", "chain.crt", "root.crt"] {
+            std::fs::write(
+                dir.path().join(file),
+                "-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n",
+            )
+            .unwrap();
+        }
+        let workload = Workload::new(dir.path().to_path_buf(), "spiffe://x/y".to_owned(), "z");
+        let url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+        (Exchanger::new(reqwest::Client::new(), &url, workload), dir)
+    }
+
+    fn caller(token: &str) -> Caller {
+        Caller {
+            subject: "s".to_owned(),
+            issuer: "origincloud:sts:z".to_owned(),
+            client: None,
+            proof: Proof::Exchange,
+            token: Arc::from(token),
+            expires_at: SystemTime::now() + Duration::from_secs(300),
+            not_before: None,
+        }
+    }
+
+    fn inflight(exchanger: &Exchanger) -> usize {
+        exchanger.inflight.lock().unwrap().len()
+    }
+
+    /// A server that accepts connections, counts them, and either hangs up
+    /// at once or never answers.
+    async fn server(hang: bool) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                if hang {
+                    held.push(stream);
+                }
+            }
+        });
+        (port, accepted)
+    }
+
+    #[tokio::test]
+    async fn an_exchange_dropped_midway_leaves_nothing_behind() {
+        let (port, accepted) = server(true).await;
+        let (exchanger, _dir) = exchanger(port);
+        let exchanger = Arc::new(exchanger);
+        let mut tasks = Vec::new();
+        for n in 0..5 {
+            let (e, c) = (Arc::clone(&exchanger), caller(&format!("token-{n}")));
+            tasks.push(tokio::spawn(async move { e.token(&c).await }));
+        }
+        while accepted.load(Ordering::SeqCst) < 5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(inflight(&exchanger), 5);
+        // The clients go away: the requests are dropped mid-exchange.
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        assert_eq!(inflight(&exchanger), 0);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_exchange_is_taken_over_by_a_waiter() {
+        let (port, accepted) = server(true).await;
+        let (exchanger, _dir) = exchanger(port);
+        let exchanger = Arc::new(exchanger);
+        let first = {
+            let (e, c) = (Arc::clone(&exchanger), caller("same"));
+            tokio::spawn(async move { e.token(&c).await })
+        };
+        while accepted.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let second = {
+            let (e, c) = (Arc::clone(&exchanger), caller("same"));
+            tokio::spawn(async move { e.token(&c).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        first.abort();
+        let _ = first.await;
+        // The waiter starts its own exchange, and the entry stays for it.
+        while accepted.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(inflight(&exchanger), 1);
+        second.abort();
+        let _ = second.await;
+        assert_eq!(inflight(&exchanger), 0);
+    }
+
+    #[tokio::test]
+    async fn waiters_share_a_failed_exchange() {
+        let (port, accepted) = server(false).await;
+        let (exchanger, _dir) = exchanger(port);
+        let exchanger = Arc::new(exchanger);
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let (e, c) = (Arc::clone(&exchanger), caller("same"));
+            tasks.push(tokio::spawn(async move { e.token(&c).await }));
+        }
+        for task in tasks {
+            assert!(matches!(
+                task.await.unwrap(),
+                Err(ExchangeError::Unreachable(_))
+            ));
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "one exchange for all");
+        assert_eq!(inflight(&exchanger), 0);
+        // Not remembered beyond the flight: asked again.
+        let _ = exchanger.token(&caller("same")).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_refusal_memory_is_bounded_and_forgets_the_oldest() {
+        let (exchanger, _dir) = exchanger(1);
+        let key = |n: u64| {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&n.to_be_bytes());
+            k
+        };
+        let refusal = || ExchangeError::Refused {
+            error: "invalid_grant".to_owned(),
+            description: None,
+        };
+        for n in 0..(MAX_REFUSALS as u64 + 5) {
+            exchanger.remember_refusal(key(n), refusal());
+        }
+        let refused = exchanger.refused.lock().unwrap();
+        assert_eq!(refused.len(), MAX_REFUSALS);
+        assert!(!refused.contains_key(&key(0)), "the oldest was kept");
+        assert!(
+            refused.contains_key(&key(MAX_REFUSALS as u64 + 4)),
+            "the newest was dropped"
+        );
     }
 }

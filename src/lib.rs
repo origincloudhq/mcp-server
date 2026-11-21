@@ -302,6 +302,7 @@ async fn admit(state: &Shared, headers: &http::HeaderMap) -> Result<Caller, Refu
                 ExchangeError::Expired | ExchangeError::Refused { .. } => {
                     Refusal::Invalid("the STS didn't accept the token".to_owned())
                 }
+                ExchangeError::Busy => Refusal::Busy,
                 error => Refusal::Unavailable(error.to_string()),
             })?;
     }
@@ -336,8 +337,16 @@ fn refuse(state: &Shared, refusal: Refusal) -> Response {
     metrics::refusal(refusal.reason());
     let config = &state.config;
     match refusal {
-        Refusal::Unavailable(error) => {
-            tracing::error!(%error, "a token couldn't be checked");
+        Refusal::Unavailable(_) | Refusal::Busy => {
+            // A real failure is an error; being asked too much is what a
+            // flood of made-up tokens does, and is counted instead
+            // (`token_exchanges_total{outcome="busy"}`).
+            match &refusal {
+                Refusal::Unavailable(error) => {
+                    tracing::error!(%error, "a token couldn't be checked");
+                }
+                _ => tracing::debug!("a token wasn't checked: too many are being checked"),
+            }
             let mut response = (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "error": "temporarily_unavailable", "error_description": "the token can't be checked now" })),

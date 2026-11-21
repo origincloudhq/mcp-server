@@ -111,6 +111,11 @@ pub enum Refusal {
     /// or the STS couldn't be asked.
     #[error("the token couldn't be checked: {0}")]
     Unavailable(String),
+    /// The STS is being asked about too many tokens nobody has checked:
+    /// try again shortly. Counted as `unavailable`, but not an error of
+    /// the server's, and not logged as one.
+    #[error("too many tokens are being checked")]
+    Busy,
 }
 
 impl Refusal {
@@ -120,7 +125,7 @@ impl Refusal {
             Self::Missing => "missing",
             Self::Invalid(_) => "invalid",
             Self::Client(_) => "client",
-            Self::Unavailable(_) => "unavailable",
+            Self::Unavailable(_) | Self::Busy => "unavailable",
         }
     }
 }
