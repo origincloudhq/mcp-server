@@ -122,8 +122,8 @@ impl ExchangeError {
 pub fn refused_impersonation(account: &str) -> String {
     format!(
         "the STS refused to issue a token of the service account {account}: the caller \
-         needs roles/iam.service-account-token-creator on it, and the account must exist \
-         and be active"
+         must be a person holding roles/iam.service-account-token-creator on it, the account \
+         must exist and be active, and the caller's sign-in must still be accepted"
     )
 }
 
