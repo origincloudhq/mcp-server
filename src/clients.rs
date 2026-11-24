@@ -7,6 +7,8 @@
 //! server. A zone STS's token is a caller of its own: two of one service
 //! account's tokens may have come from different CI jobs or keys, which the
 //! API checks and records per token, so neither may call with the other's.
+//! A person acting as a service account (`?service_account=`) is a caller
+//! apart from the person acting as themselves, one per account.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -45,13 +47,15 @@ pub struct Registry {
     callers: Mutex<HashMap<Key, Held>>,
 }
 
-/// Whose client a request uses: the token's issuer and subject, and for a
-/// zone STS's token the token itself (its SHA-256).
+/// Whose client a request uses: the token's issuer and subject, for a zone
+/// STS's token the token itself (its SHA-256), and the service account the
+/// caller acts as.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
     issuer: String,
     subject: String,
     token: Option<[u8; 32]>,
+    service_account: Option<Arc<str>>,
 }
 
 impl Key {
@@ -63,6 +67,7 @@ impl Key {
             issuer: caller.issuer.clone(),
             subject: caller.subject.clone(),
             token,
+            service_account: caller.service_account.clone(),
         }
     }
 }
@@ -182,7 +187,7 @@ impl Credentials for Shared {
                     // The detail is for the logs; the tool's caller is
                     // told no more than what they can act on.
                     tracing::warn!(error = %e, "the caller's token couldn't be exchanged");
-                    origincloud_core::Error::Credentials(e.public().to_owned())
+                    origincloud_core::Error::Credentials(e.public_for(&caller))
                 })
         })
     }

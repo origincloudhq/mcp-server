@@ -15,7 +15,9 @@
 //!   attempted: too many tokens nobody has checked were being exchanged).
 //! - `origincloud_mcp_auth_refusals_total{reason}`: requests refused for
 //!   their token: `missing`, `invalid`, `client` (a valid token of a client
-//!   the server is restricted from, `--allowed-clients`) or `unavailable`
+//!   the server is restricted from, `--allowed-clients`), `impersonation`
+//!   (the STS refused the caller the token of the service account the
+//!   connection names, `?service_account=`) or `unavailable`
 //!   (the token couldn't be checked: the realm's keys couldn't be read, or
 //!   the STS couldn't be asked or is being asked too much).
 //! - `origincloud_build_info{artifact,version}`: 1.
@@ -148,6 +150,7 @@ pub fn refusal(reason: &str) {
 pub struct Logged {
     pub subject: String,
     pub client: Option<String>,
+    pub service_account: Option<std::sync::Arc<str>>,
 }
 
 /// Counts and times a request, and logs it. Applied with
@@ -187,6 +190,9 @@ pub async fn requests(request: Request, next: Next) -> Response {
         request_id,
         subject = caller.map(|c| c.subject.as_str()).unwrap_or_default(),
         client = caller.and_then(|c| c.client.as_deref()).unwrap_or_default(),
+        service_account = caller
+            .and_then(|c| c.service_account.as_deref())
+            .unwrap_or_default(),
         "request"
     );
     response

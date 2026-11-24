@@ -4,6 +4,12 @@
 //! for them (`act`). The server proves itself with its workload certificate
 //! as the `actor_token` ([`crate::workload`]). The caller's token never
 //! leaves the server except to the STS.
+//!
+//! On a connection that names a service account (`?service_account=`) the
+//! exchange names it too, and the STS answers with that account's token,
+//! the caller nested in its `act`, if the caller may impersonate it. A
+//! refusal is the caller's error: the caller's own rights are never used
+//! instead.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -21,6 +27,10 @@ use crate::workload::{Workload, WorkloadError, ASSERTION_TOKEN_TYPE};
 
 const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+
+/// The STS's parameter naming the service account to impersonate, by its
+/// full name.
+const SERVICE_ACCOUNT_PARAMETER: &str = "service_account";
 
 /// How long before its expiry an exchanged token is replaced, so that it
 /// doesn't expire on the way to the API.
@@ -96,6 +106,25 @@ impl ExchangeError {
             _ => "the caller's token couldn't be exchanged now; try again later",
         }
     }
+
+    /// What `caller` may be told: [`ExchangeError::public`], or for a
+    /// refused impersonation, which account and which role it takes.
+    pub fn public_for(&self, caller: &Caller) -> String {
+        match (self, caller.service_account.as_deref()) {
+            (Self::Refused { .. }, Some(account)) => refused_impersonation(account),
+            _ => self.public().to_owned(),
+        }
+    }
+}
+
+/// What a caller refused the token of `account` is told. The STS says no
+/// more than `invalid_grant`, whatever the reason, so neither does this.
+pub fn refused_impersonation(account: &str) -> String {
+    format!(
+        "the STS refused to issue a token of the service account {account}: the caller \
+         must be a person holding roles/iam.service-account-token-creator on it, the account \
+         must exist and be active, and the caller's sign-in must still be accepted"
+    )
 }
 
 impl From<WorkloadError> for ExchangeError {
@@ -154,6 +183,20 @@ impl Drop for Joined {
     }
 }
 
+/// What an exchanged token is held by: the SHA-256 of the caller's token,
+/// and of the service account it acts as. One token exchanged with and
+/// without an account is two exchanges, and neither answers for the other.
+fn key_of(caller: &Caller) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(caller.token.as_bytes());
+    if let Some(account) = &caller.service_account {
+        // A token is a JWT, which holds no NUL: nothing else hashes alike.
+        hash.update([0]);
+        hash.update(account.as_bytes());
+    }
+    hash.finalize().into()
+}
+
 /// A rate limit by a bucket that fills continuously.
 struct Bucket {
     tokens: f64,
@@ -167,8 +210,8 @@ pub struct Exchanger {
     /// The STS's token endpoint.
     endpoint: Url,
     workload: Workload,
-    /// By the SHA-256 of the caller's token: the server holds the tokens it
-    /// was issued, not the callers'.
+    /// By [`key_of`] the caller: the server holds the tokens it was issued,
+    /// not the callers'.
     cache: Mutex<HashMap<[u8; 32], Exchanged>>,
     /// The tokens the STS refused, and when that is forgotten.
     refused: Mutex<HashMap<[u8; 32], (Instant, ExchangeError)>>,
@@ -218,7 +261,7 @@ impl Exchanger {
         if caller.expires_at <= now {
             return Err(ExchangeError::Expired);
         }
-        let key: [u8; 32] = Sha256::digest(caller.token.as_bytes()).into();
+        let key = key_of(caller);
         if let Some(found) = self.held(&key, now) {
             return found;
         }
@@ -281,7 +324,10 @@ impl Exchanger {
         } else {
             None
         };
-        let issued = match self.exchange(&caller.token, now).await {
+        let issued = match self
+            .exchange(&caller.token, caller.service_account.as_deref(), now)
+            .await
+        {
             Ok(issued) => issued,
             Err(error) => {
                 metrics::exchange("failed");
@@ -337,26 +383,32 @@ impl Exchanger {
     }
 
     /// The exchange itself (RFC 8693, section 2.1): the caller's token as
-    /// the subject, this server's workload assertion as the actor.
+    /// the subject, this server's workload assertion as the actor, and the
+    /// service account to impersonate, if any.
     async fn exchange(
         &self,
         subject_token: &str,
+        service_account: Option<&str>,
         now: SystemTime,
     ) -> Result<Issued, ExchangeError> {
         let seconds = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let assertion = self.workload.assertion(seconds).await?;
+        let mut form = vec![
+            ("grant_type", GRANT_TYPE),
+            ("subject_token", subject_token),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("requested_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", assertion.as_str()),
+            ("actor_token_type", ASSERTION_TOKEN_TYPE),
+        ];
+        if let Some(account) = service_account {
+            form.push((SERVICE_ACCOUNT_PARAMETER, account));
+        }
         let response = self
             .http
             .post(self.endpoint.clone())
             .timeout(REQUEST_TIMEOUT)
-            .form(&[
-                ("grant_type", GRANT_TYPE),
-                ("subject_token", subject_token),
-                ("subject_token_type", ACCESS_TOKEN_TYPE),
-                ("requested_token_type", ACCESS_TOKEN_TYPE),
-                ("actor_token", assertion.as_str()),
-                ("actor_token_type", ASSERTION_TOKEN_TYPE),
-            ])
+            .form(&form)
             .send()
             .await
             .map_err(|e| ExchangeError::Unreachable(e.without_url().to_string()))?;
@@ -502,6 +554,7 @@ mod tests {
             token: Arc::from(token),
             expires_at: SystemTime::now() + Duration::from_secs(300),
             not_before: None,
+            service_account: None,
         }
     }
 

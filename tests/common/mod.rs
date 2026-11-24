@@ -218,6 +218,11 @@ impl WorkloadFiles {
 /// issuer, subject, audience and lifetime, a chain of three certificates)
 /// and of the subject (the signature, by the realm's key or its own), and
 /// answers `exchanged-{sub}-{n}`, recording each request.
+///
+/// An exchange naming a `service_account` is an impersonation: the subject
+/// must be a person of the realm holding one of [`Sts::bindings`], and the
+/// answer is `impersonated-{account id}-by-{sub}-{n}`; anything else is
+/// `invalid_grant`, as the real STS answers every refusal.
 pub struct Sts {
     server: FakeServer,
     key: EncodingKey,
@@ -231,6 +236,9 @@ pub struct Sts {
     pub error: Arc<Mutex<String>>,
     /// How long an exchange takes, in milliseconds.
     pub delay_ms: Arc<AtomicUsize>,
+    /// Who may impersonate which service account: (the person's `sub`, the
+    /// account's full name).
+    pub bindings: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 /// A fresh Ed25519 key as the STS signs with: its encoding key and the
@@ -271,6 +279,8 @@ impl Sts {
         let unavailable = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new("invalid_grant".to_owned()));
         let delay_ms = Arc::new(AtomicUsize::new(0));
+        let bindings = Arc::new(Mutex::new(Vec::new()));
+        let bound = Arc::clone(&bindings);
         let count = Arc::new(AtomicUsize::new(0));
         let (seen, refusing, down, code, delay) = (
             Arc::clone(&exchanges),
@@ -293,10 +303,13 @@ impl Sts {
                         &r,
                         &count,
                         refusing.load(Ordering::SeqCst),
-                        &realm,
-                        &workload,
-                        &public,
+                        Keys {
+                            realm: &realm,
+                            workload: &workload,
+                            sts: &public,
+                        },
                         &code,
+                        &bound.lock().unwrap(),
                     )
                 }
             };
@@ -316,7 +329,16 @@ impl Sts {
             unavailable,
             error,
             delay_ms,
+            bindings,
         }
+    }
+
+    /// Lets `person` (a name or a user id) impersonate `account`.
+    pub fn bind(&self, person: &str, account: &str) {
+        self.bindings
+            .lock()
+            .unwrap()
+            .push((person_id(person), account.to_owned()));
     }
 
     pub fn url(&self) -> String {
@@ -376,14 +398,21 @@ pub fn form(r: &Received) -> Vec<(String, String)> {
     url::form_urlencoded::parse(&r.body).into_owned().collect()
 }
 
+/// The public keys the fake STS checks tokens with: the realm's, the
+/// workload's, and its own.
+struct Keys<'a> {
+    realm: &'a Value,
+    workload: &'a Value,
+    sts: &'a str,
+}
+
 fn exchange(
     r: &Received,
     count: &AtomicUsize,
     refuse: bool,
-    realm: &Value,
-    workload: &Value,
-    sts: &str,
+    keys: Keys<'_>,
     error: &str,
+    bindings: &[(String, String)],
 ) -> Response {
     let invalid_grant = || Response::json(json!({ "error": error }).to_string()).with_status(400);
     // The actor's assertion not accepted: the acting client failed to
@@ -414,7 +443,8 @@ fn exchange(
     validation.set_audience(&[format!("origincloud:sts:{ZONE}")]);
     validation.set_issuer(&[WORKLOAD_ID]);
     validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
-    let Ok(asserted) = jsonwebtoken::decode::<Value>(&actor, &components(workload), &validation)
+    let Ok(asserted) =
+        jsonwebtoken::decode::<Value>(&actor, &components(keys.workload), &validation)
     else {
         return invalid_client();
     };
@@ -427,21 +457,43 @@ fn exchange(
     }
     // The subject: signed by the realm, or by this STS.
     let sub = claims(&subject);
-    let signed = if sub["iss"]
+    let of_sts = sub["iss"]
         .as_str()
         .unwrap_or_default()
-        .starts_with("origincloud:sts:")
-    {
+        .starts_with("origincloud:sts:");
+    let signed = if of_sts {
         signed_by(
             &subject,
-            &DecodingKey::from_ed_components(sts).unwrap(),
+            &DecodingKey::from_ed_components(keys.sts).unwrap(),
             Algorithm::EdDSA,
         )
     } else {
-        signed_by(&subject, &components(realm), Algorithm::ES256)
+        signed_by(&subject, &components(keys.realm), Algorithm::ES256)
     };
     if !signed {
         return invalid_grant();
+    }
+    let subject_id = sub["sub"].as_str().unwrap_or_default().to_owned();
+    if let Some(account) = get("service_account") {
+        // Only a person impersonates, and only an account bound to them.
+        if of_sts
+            || !bindings
+                .iter()
+                .any(|(person, bound)| *person == subject_id && *bound == account)
+        {
+            return invalid_grant();
+        }
+        let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+        let id = account.rsplit('/').next().unwrap_or_default();
+        return Response::json(
+            json!({
+                "access_token": format!("impersonated-{id}-by-{subject_id}-{n}"),
+                "expires_in": 300,
+                "token_type": "Bearer",
+                "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            })
+            .to_string(),
+        );
     }
     let n = count.fetch_add(1, Ordering::SeqCst) + 1;
     Response::json(

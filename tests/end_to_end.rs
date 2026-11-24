@@ -1016,3 +1016,207 @@ async fn post(url: &str, authorization: &str) -> u16 {
         .status()
         .as_u16()
 }
+
+/// A service account holding only a viewer role.
+const VIEWER: &str = "//iam.origincloudapis.eu/organizations/o-1/serviceAccounts/sa-viewer";
+
+/// The fake PVS as the API's checks make it look: the viewer account may
+/// read the volume but not delete it, and a person may do both.
+fn pvs_with_a_viewer(r: &Received) -> Response {
+    let token = r.header("authorization").unwrap_or_default();
+    if r.method == "DELETE" && token.starts_with("Bearer impersonated-sa-viewer-") {
+        return Response::json(
+            json!({ "error": {
+                "code": 403,
+                "status": "PERMISSION_DENIED",
+                "message": "the caller lacks pvs.volumes.delete"
+            }})
+            .to_string(),
+        )
+        .with_status(403);
+    }
+    pvs(r)
+}
+
+fn service_account_query(account: &str) -> String {
+    let encoded: String = url::form_urlencoded::byte_serialize(account.as_bytes()).collect();
+    format!("?service_account={encoded}")
+}
+
+#[tokio::test]
+async fn a_connection_naming_a_service_account_acts_as_it_and_the_api_decides() {
+    let h = Harness::start(pvs_with_a_viewer).await;
+    h.sts.bind("alice", VIEWER);
+    let token = h.token_for("alice");
+    let agent = h.connect(&token, &service_account_query(VIEWER)).await;
+
+    let read = agent
+        .call("pvs_get_volume", json!({ "name": VOLUME }))
+        .await;
+    assert_ne!(read.is_error, Some(true), "{read:?}");
+    assert_eq!(read.structured_content.as_ref().unwrap()["sizeGib"], 8);
+
+    // The write tool is served; the API refuses it, for the account.
+    let deleted = agent
+        .call("pvs_delete_volume", json!({ "name": VOLUME }))
+        .await;
+    assert_eq!(deleted.is_error, Some(true), "{deleted:?}");
+    let text = serde_json::to_string(&deleted).unwrap();
+    assert!(text.contains("pvs.volumes.delete"), "{text}");
+
+    let impersonated = format!("Bearer impersonated-sa-viewer-by-{}-1", person_id("alice"));
+    let received = h.api.received();
+    assert_eq!(received.len(), 2, "both calls reached the API");
+    assert_eq!(received[1].method, "DELETE");
+    for r in &received {
+        assert_eq!(r.header("authorization"), Some(impersonated.as_str()));
+        assert!(
+            !everything(r).contains(&token),
+            "the person's token reached the API"
+        );
+    }
+
+    // One exchange, naming the account, held for every request after it.
+    let exchanges = h.sts.exchanges();
+    assert_eq!(exchanges.len(), 1);
+    let form = form(&exchanges[0]);
+    let get = |k: &str| {
+        form.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(get("service_account"), Some(VIEWER));
+    assert_eq!(get("subject_token"), Some(token.as_str()));
+    assert!(get("actor_token").is_some());
+}
+
+#[tokio::test]
+async fn a_person_and_their_impersonation_are_callers_apart() {
+    let h = Harness::start(pvs_with_a_viewer).await;
+    h.sts.bind("alice", VIEWER);
+    let token = h.token_for("alice");
+    let as_viewer = h.connect(&token, &service_account_query(VIEWER)).await;
+    let as_alice = h.connect(&token, "").await;
+
+    as_viewer
+        .call("pvs_get_volume", json!({ "name": VOLUME }))
+        .await;
+    let deleted = as_alice
+        .call("pvs_delete_volume", json!({ "name": VOLUME }))
+        .await;
+    assert_ne!(deleted.is_error, Some(true), "{deleted:?}");
+    as_viewer
+        .call("pvs_get_volume", json!({ "name": VOLUME }))
+        .await;
+
+    let tokens: Vec<_> = h
+        .api
+        .received()
+        .iter()
+        .map(|r| r.header("authorization").unwrap_or_default().to_owned())
+        .collect();
+    let alice = person_id("alice");
+    assert_eq!(
+        tokens,
+        [
+            format!("Bearer impersonated-sa-viewer-by-{alice}-1"),
+            format!("Bearer exchanged-{alice}-2"),
+            format!("Bearer impersonated-sa-viewer-by-{alice}-1"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn without_the_binding_the_connection_is_refused_never_served_as_the_person() {
+    let h = Harness::start(pvs_with_a_viewer).await;
+    let token = h.token_for("alice");
+
+    let response = h
+        .post(&service_account_query(VIEWER), Some(&bearer(&token)))
+        .await;
+    assert_eq!(response.status(), 403);
+    let challenge = header(&response, "www-authenticate").to_owned();
+    assert!(challenge.contains("insufficient_scope"), "{challenge}");
+    let body: Value = response.json().await.unwrap();
+    let description = body["error_description"].as_str().unwrap();
+    assert!(description.contains(VIEWER), "{body}");
+    assert!(
+        description.contains("roles/iam.service-account-token-creator"),
+        "{body}"
+    );
+
+    // The STS was asked for the account's token, and only that.
+    let exchanges = h.sts.exchanges();
+    assert_eq!(exchanges.len(), 1);
+    assert!(form(&exchanges[0])
+        .iter()
+        .any(|(k, v)| k == "service_account" && v == VIEWER));
+    assert!(h.api.received().is_empty());
+
+    // Asked again, refused again: the refusal is remembered.
+    let again = h
+        .post(&service_account_query(VIEWER), Some(&bearer(&token)))
+        .await;
+    assert_eq!(again.status(), 403);
+    assert_eq!(h.sts.exchanges().len(), 1);
+
+    let metrics = reqwest::get(format!("{}/metrics", h.metrics_url))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("origincloud_mcp_auth_refusals_total{reason=\"impersonation\"}"),
+        "{metrics}"
+    );
+
+    // The same person without the parameter is served as themselves.
+    let served = h.post("", Some(&bearer(&token))).await;
+    assert_eq!(served.status(), 200);
+}
+
+#[tokio::test]
+async fn a_service_account_s_own_token_impersonates_nothing() {
+    let h = Harness::start(pvs).await;
+    let token = h.sts.token(
+        ZONE,
+        json!({
+            "sub": "//iam.origincloudapis.eu/organizations/o-1/serviceAccounts/sa-ci",
+            "aud": [h.url.clone()],
+        }),
+    );
+    let response = h
+        .post(&service_account_query(VIEWER), Some(&bearer(&token)))
+        .await;
+    assert_eq!(response.status(), 403);
+    assert!(h.api.received().is_empty());
+}
+
+#[tokio::test]
+async fn a_malformed_service_account_is_refused_before_any_exchange() {
+    let h = Harness::start(pvs).await;
+    let token = h.token_for("alice");
+    for query in [
+        "?service_account=".to_owned(),
+        "?service_account=sa-viewer".to_owned(),
+        service_account_query("organizations/o-1/serviceAccounts/sa-viewer"),
+        service_account_query("//iam.origincloudapis.eu/users/u-1"),
+        service_account_query("//pvs.origincloudapis.eu/projects/p"),
+        format!("{}&service_account=x", service_account_query(VIEWER)),
+    ] {
+        let response = h.post(&query, Some(&bearer(&token))).await;
+        assert_eq!(response.status(), 400, "{query}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "invalid_request", "{query}: {body}");
+        assert!(
+            body["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("service_account"),
+            "{query}: {body}"
+        );
+    }
+    assert!(h.sts.exchanges().is_empty());
+    assert!(h.api.received().is_empty());
+}
