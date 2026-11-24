@@ -83,6 +83,10 @@ pub struct Caller {
     pub expires_at: SystemTime,
     /// When the token becomes valid, if it says.
     pub not_before: Option<SystemTime>,
+    /// The service account the caller acts as on this connection, by its
+    /// full name (`?service_account=`): the API is called with that
+    /// account's token, never the caller's own.
+    pub service_account: Option<Arc<str>>,
 }
 
 impl fmt::Debug for Caller {
@@ -90,6 +94,7 @@ impl fmt::Debug for Caller {
         f.debug_struct("Caller")
             .field("subject", &self.subject)
             .field("client", &self.client)
+            .field("service_account", &self.service_account)
             .finish_non_exhaustive()
     }
 }
@@ -107,6 +112,10 @@ pub enum Refusal {
     /// restricted not to serve (`--allowed-clients`).
     #[error("{0}")]
     Client(String),
+    /// The token is valid, but the STS refused to let its caller act as
+    /// the service account the connection names (`?service_account=`).
+    #[error("{0}")]
+    Impersonation(String),
     /// The token couldn't be checked: the issuer's keys couldn't be read,
     /// or the STS couldn't be asked.
     #[error("the token couldn't be checked: {0}")]
@@ -125,6 +134,7 @@ impl Refusal {
             Self::Missing => "missing",
             Self::Invalid(_) => "invalid",
             Self::Client(_) => "client",
+            Self::Impersonation(_) => "impersonation",
             Self::Unavailable(_) | Self::Busy => "unavailable",
         }
     }
@@ -395,6 +405,7 @@ impl Authenticator {
             token: Arc::from(token),
             expires_at,
             not_before,
+            service_account: None,
         })
     }
 
@@ -436,6 +447,7 @@ impl Authenticator {
             token: Arc::from(token),
             expires_at,
             not_before,
+            service_account: None,
         })
     }
 
@@ -484,7 +496,7 @@ fn describe(error: &jsonwebtoken::errors::Error, audience: &str) -> String {
 /// and a client stepping up would only ask for the same token again.
 pub fn challenge(metadata_url: &str, scopes: &[String], refusal: &Refusal) -> String {
     let mut params = vec![format!("resource_metadata=\"{metadata_url}\"")];
-    if let Refusal::Client(description) = refusal {
+    if let Refusal::Client(description) | Refusal::Impersonation(description) = refusal {
         params.push("error=\"insufficient_scope\"".to_owned());
         params.push(format!(
             "error_description=\"{}\"",

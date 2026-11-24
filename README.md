@@ -34,6 +34,7 @@ take nothing but a URL:
 |---|---|---|
 | `toolsets` | The toolsets to expose, by service, comma-separated or repeated: `pvs,compute` | every toolset |
 | `read_only` | `true` exposes only the tools that change nothing: reads, and waiting on operations | `false` |
+| `service_account` | A service account to act as, by its full name: `//iam.origincloudapis.eu/organizations/{organization}/serviceAccounts/{service_account}` (see [Acting as a service account](#acting-as-a-service-account)) | you, with your own roles |
 
 ```text
 https://mcp.origincloudapis.eu/?toolsets=pvs,compute&read_only=true
@@ -42,6 +43,49 @@ https://mcp.origincloudapis.eu/?toolsets=pvs,compute&read_only=true
 A misspelt parameter or toolset is refused with `400`, naming the ones there
 are. Tools that delete something, or change it for good, are marked
 destructive for your client to confirm.
+
+`toolsets` and `read_only` only choose which tools your client sees. The
+API decides what a call may do, by the roles of whoever the call is made
+as.
+
+### Acting as a service account
+
+To give an agent less than your own rights, connect it as a service account
+that holds only the roles the agent needs, such as a viewer role on one
+project:
+
+```text
+https://mcp.origincloudapis.eu/?service_account=//iam.origincloudapis.eu/organizations/{organization}/serviceAccounts/{service_account}
+```
+
+You still log in as yourself. The server then asks the STS for the service
+account's token instead of yours (token exchange naming the account in
+`service_account`), and every tool call reaches the API with that token.
+The API enforces the account's roles: a write the account may not make is
+refused `403` by the API, and the tool returns that error. The audit log
+names the service account as the principal, with you and this server as
+the parties acting for it.
+
+- You need `roles/iam.service-account-token-creator`
+  (`iam.serviceAccounts.getAccessToken`) in the account's organisation. The
+  account may be `EXTERNAL` or `WORKLOAD`.
+- Without that binding, or if the account doesn't exist or isn't active, the
+  connection's first request is answered `403` with
+  `WWW-Authenticate: Bearer error="insufficient_scope"` and a description
+  naming the account and the role. The STS doesn't say which of these it
+  was, so the server can't say either. Your own token is never used in its
+  place. A refusal is remembered for thirty seconds, like any other.
+- Only a person can impersonate a service account: a service account's own
+  token on such a connection is refused the same way.
+- The value must be a service account's full name in its one spelling,
+  URL-encoded or not. Anything else, an empty value, or the parameter given
+  twice, is refused with `400` before the STS is asked.
+- If a binding is removed, the next exchange is refused. A token already
+  issued stays valid until it expires, at most the STS's token lifetime, and
+  never past your own token.
+
+The same parameter names the account at the STS for the CLI's
+`--impersonate-service-account` and the SDKs' impersonation option.
 
 ## How it authorizes
 
@@ -87,13 +131,21 @@ requires:
    `WWW-Authenticate: Bearer error="insufficient_scope"` (RFC 6750, section
    3.1), before it is ever exchanged.
 4. A refused token is counted by reason in
-   `origincloud_mcp_auth_refusals_total{reason}`.
+   `origincloud_mcp_auth_refusals_total{reason}`. A token the STS refused for
+   the service account the connection names is answered `403` and counted
+   as `impersonation` (see
+   [Acting as a service account](#acting-as-a-service-account)).
 5. A tool call reaches the API with an access token the STS issues by token
    exchange (RFC 8693): the caller's token as the `subject_token`, and this
    server's own credential as the `actor_token`, an assertion signed with the
    server's workload certificate of the zone's certificate authority (see
    below). The issued token keeps the caller as its subject and names this
-   server as the party acting for them (`act`). It is kept until shortly
+   server as the party acting for them (`act`). On a connection naming a
+   service account the exchange names it too (`service_account`), and the
+   issued token is the account's, the caller in its `act` with this server
+   nested inside. Such a token is held apart from the caller's own, and
+   such a connection's token is exchanged before its first request is
+   served, whoever issued it. It is kept until shortly
    before it expires, and never past the caller's token; a token the STS
    refused (`invalid_grant`, and nothing else) isn't asked about again for
    thirty seconds, unless it isn't valid yet; callers presenting the same
@@ -167,14 +219,15 @@ and run as a user without privileges.
 ### Observing it
 
 - **Logs:** one JSON line per request on standard output, with its method,
-  route, status, duration, `x-request-id`, and the token's subject and
-  client. Tokens are never logged.
+  route, status, duration, `x-request-id`, the token's subject and client,
+  and the service account the connection acts as, if any. Tokens are never
+  logged.
 - **Metrics** (Prometheus, on the metrics port):
   `origincloud_http_requests_total`, `origincloud_http_request_duration_seconds`,
   `origincloud_http_requests_in_flight`, `origincloud_mcp_tool_calls_total{tool,outcome}`,
   `origincloud_mcp_token_exchanges_total{outcome}`,
   `origincloud_mcp_auth_refusals_total{reason}` (`missing`, `invalid`, `client`,
-  `unavailable`) and `origincloud_build_info`.
+  `impersonation`, `unavailable`) and `origincloud_build_info`.
 - **Health:** `/healthz` answers while the process runs; `/readyz` once the
   realm's configuration has been read, and until a termination signal.
 

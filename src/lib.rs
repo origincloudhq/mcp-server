@@ -14,6 +14,10 @@
 //!   acting for them, never with the caller's own; see [`exchange`].
 //! - The connection's toolsets and read-only mode come from the URL's query;
 //!   see [`options`].
+//! - A connection whose URL names a service account (`?service_account=`)
+//!   calls the API with that account's token, which the STS issues only to
+//!   a person allowed to impersonate it. A refusal is answered `403` on the
+//!   connection's first request, never served with the person's own token.
 //!
 //! The server keeps no MCP sessions: each request is served on its own, so
 //! that any replica can answer any request. A caller's SDK client is kept
@@ -51,7 +55,7 @@ use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetReques
 use crate::auth::{Authenticator, Caller, Issuer, Proof, Refusal};
 use crate::clients::{Api, Registry};
 use crate::config::Config;
-use crate::exchange::{ExchangeError, Exchanger};
+use crate::exchange::{refused_impersonation, ExchangeError, Exchanger};
 use crate::session::Session;
 use crate::workload::Workload;
 
@@ -258,22 +262,24 @@ async fn mcp(State(state): State<Arc<Shared>>, mut request: Request) -> Response
         region: state.config.api_region.clone(),
         ..Defaults::default()
     };
-    let options =
+    let connection =
         match options::parse(request.uri().query(), defaults) {
-            Ok(options) => options,
+            Ok(connection) => connection,
             Err(error) => return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "invalid_request", "error_description": error.to_string() })),
             )
                 .into_response(),
         };
-    let caller = match admit(&state, request.headers()).await {
+    let options = connection.options;
+    let caller = match admit(&state, request.headers(), connection.service_account).await {
         Ok(caller) => caller,
         Err(refusal) => return refuse(&state, refusal),
     };
     let logged = metrics::Logged {
         subject: caller.subject.clone(),
         client: caller.client.clone(),
+        service_account: caller.service_account.clone(),
     };
     request.extensions_mut().insert::<Caller>(caller);
     let registry = Arc::clone(&state.registry);
@@ -287,24 +293,33 @@ async fn mcp(State(state): State<Arc<Shared>>, mut request: Request) -> Response
     response
 }
 
-/// The caller of a request. A token whose signature this server can't check
-/// (a zone STS's) is exchanged now, which is the STS checking it: the
-/// request is served only if the STS took the token, and the exchanged token
-/// is kept for the tool calls that follow.
-async fn admit(state: &Shared, headers: &http::HeaderMap) -> Result<Caller, Refusal> {
-    let caller = state.authenticator.authenticate(headers).await?;
-    if caller.proof == Proof::Exchange {
-        state
-            .exchanger
-            .token(&caller)
-            .await
-            .map_err(|error| match error {
-                ExchangeError::Expired | ExchangeError::Refused { .. } => {
+/// The caller of a request, acting as `service_account` if the connection
+/// names one. A token whose signature this server can't check (a zone
+/// STS's) is exchanged now, which is the STS checking it, and so is every
+/// token on a connection naming a service account, which is the STS
+/// checking that the caller may act as it: the request is served only if
+/// the STS took the token, and the exchanged token is kept for the tool
+/// calls that follow.
+async fn admit(
+    state: &Shared,
+    headers: &http::HeaderMap,
+    service_account: Option<Arc<str>>,
+) -> Result<Caller, Refusal> {
+    let mut caller = state.authenticator.authenticate(headers).await?;
+    caller.service_account = service_account;
+    if caller.proof == Proof::Exchange || caller.service_account.is_some() {
+        state.exchanger.token(&caller).await.map_err(|error| {
+            match (error, caller.service_account.as_deref()) {
+                (ExchangeError::Refused { .. }, Some(account)) => {
+                    Refusal::Impersonation(refused_impersonation(account))
+                }
+                (ExchangeError::Expired | ExchangeError::Refused { .. }, _) => {
                     Refusal::Invalid("the STS didn't accept the token".to_owned())
                 }
-                ExchangeError::Busy => Refusal::Busy,
-                error => Refusal::Unavailable(error.to_string()),
-            })?;
+                (ExchangeError::Busy, _) => Refusal::Busy,
+                (error, _) => Refusal::Unavailable(error.to_string()),
+            }
+        })?;
     }
     Ok(caller)
 }
@@ -358,13 +373,18 @@ fn refuse(state: &Shared, refusal: Refusal) -> Response {
             response
         }
         refusal => {
-            if let Refusal::Invalid(reason) | Refusal::Client(reason) = &refusal {
+            if let Refusal::Invalid(reason)
+            | Refusal::Client(reason)
+            | Refusal::Impersonation(reason) = &refusal
+            {
                 tracing::info!(reason, "refused a token");
             }
             let challenge = auth::challenge(&config.metadata_url(), &config.scopes, &refusal);
             let (status, error) = match refusal {
                 Refusal::Invalid(_) => (StatusCode::UNAUTHORIZED, "invalid_token"),
-                Refusal::Client(_) => (StatusCode::FORBIDDEN, "insufficient_scope"),
+                Refusal::Client(_) | Refusal::Impersonation(_) => {
+                    (StatusCode::FORBIDDEN, "insufficient_scope")
+                }
                 _ => (StatusCode::UNAUTHORIZED, "unauthorized"),
             };
             let mut response = (
