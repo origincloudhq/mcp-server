@@ -1,6 +1,6 @@
 [package]
 name = "origincloud-mcp-server"
-version = "0.2.1"
+version = "0.3.0"
 description = "The hosted Origin Cloud MCP server: the tools of origincloudhq/mcp over Streamable HTTP, as an OAuth resource server."
 edition = "2021"
 license = "Apache-2.0"
