@@ -108,7 +108,10 @@ requires:
      the realm. Any client's token is accepted, if it is a person's access
      token as the STS requires it (type `Bearer`, a user id as the subject,
      and the `email`, `email_verified`, `name`, `given_name` and
-     `family_name` claims): anything else is refused early.
+     `family_name` claims): anything else is refused early. A person whose
+     token lacks a name or email is told which parts of their profile are
+     missing and to add them in the realm's account console
+     (`<issuer>/account`), then sign in again.
    - **A zone's security token service (STS)**, whose tokens name it as
      `origincloud:sts:<zone>`, such as a service account's token for this
      server's audience. Its issuer, audience and lifetime are checked here;

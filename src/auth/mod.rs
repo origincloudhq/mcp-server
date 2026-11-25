@@ -386,16 +386,25 @@ impl Authenticator {
         if uuid::Uuid::parse_str(&subject).is_err() {
             return Err(not_a_person("its subject isn't a user's id"));
         }
+        if claims.email_verified.is_none() {
+            return Err(not_a_person("it lacks the email_verified claim"));
+        }
         let named = |claim: &Option<String>| claim.as_deref().is_some_and(|c| !c.is_empty());
-        if !(named(&claims.email)
-            && claims.email_verified.is_some()
-            && named(&claims.name)
-            && named(&claims.given_name)
-            && named(&claims.family_name))
-        {
-            return Err(not_a_person(
-                "it lacks the email, email_verified, name, given_name or family_name claim",
-            ));
+        let missing: Vec<ProfileField> = [
+            (ProfileField::FirstName, &claims.given_name),
+            (ProfileField::LastName, &claims.family_name),
+            (ProfileField::Email, &claims.email),
+            (ProfileField::Name, &claims.name),
+        ]
+        .into_iter()
+        .filter(|(_, claim)| !named(claim))
+        .map(|(field, _)| field)
+        .collect();
+        if !missing.is_empty() {
+            return Err(Refusal::Invalid(incomplete_profile(
+                &missing,
+                self.issuer.id(),
+            )));
         }
         Ok(Caller {
             subject,
@@ -461,6 +470,48 @@ impl Authenticator {
         }
         Err(Refusal::Client(NOT_FOR_THIS_CLIENT.to_owned()))
     }
+}
+
+/// A part of a person's profile that their token carries as a claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileField {
+    FirstName,
+    LastName,
+    Email,
+    /// The full name, which the realm puts together from the first and last
+    /// name.
+    Name,
+}
+
+impl ProfileField {
+    /// What the person calls it, and the claim that carries it.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::FirstName => "first name (given_name)",
+            Self::LastName => "last name (family_name)",
+            Self::Email => "email (email)",
+            Self::Name => "name (name)",
+        }
+    }
+}
+
+/// What a person is told whose token lacks parts of their profile: which
+/// parts, and how to add them. A token's issuer that is an `https` URL is
+/// the realm, whose account console is at `<issuer>/account`.
+fn incomplete_profile(missing: &[ProfileField], issuer: &str) -> String {
+    let fields: Vec<&str> = missing.iter().map(|f| f.describe()).collect();
+    let console = if issuer.starts_with("https://") {
+        format!(
+            "the account console at {}/account",
+            issuer.trim_end_matches('/')
+        )
+    } else {
+        "your account console".to_owned()
+    };
+    format!(
+        "your profile is incomplete, it has no {}: add your first name, last name and email in {console}, then sign in again",
+        fields.join(", ")
+    )
 }
 
 /// Why a token issued to another client is refused when the server is
@@ -566,6 +617,45 @@ mod tests {
         assert!(c.starts_with("Bearer resource_metadata=\"https://m/.well-known/oauth-protected-resource\", error=\"insufficient_scope\", error_description=\""), "{c}");
         assert!(!c.contains("scope=\"mcp\""), "{c}");
         assert!(c.contains("restricted"), "{c}");
+    }
+
+    #[test]
+    fn an_incomplete_profile_names_what_is_missing_and_where_to_add_it() {
+        let m = incomplete_profile(
+            &[ProfileField::FirstName, ProfileField::LastName],
+            "https://auth.example.com/realms/people/",
+        );
+        assert_eq!(
+            m,
+            "your profile is incomplete, it has no first name (given_name), last name (family_name): add your first name, last name and email in the account console at https://auth.example.com/realms/people/account, then sign in again"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_profile_of_an_issuer_without_a_console_url_names_none() {
+        let m = incomplete_profile(&[ProfileField::Email], "urn:example:issuer");
+        assert!(m.contains("no email (email)"), "{m}");
+        assert!(
+            m.ends_with("in your account console, then sign in again"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_profile_s_challenge_keeps_its_url() {
+        let refusal = Refusal::Invalid(incomplete_profile(
+            &[ProfileField::Name],
+            "https://auth.example.com/realms/people",
+        ));
+        let c = challenge(
+            "https://m/.well-known/oauth-protected-resource",
+            &[],
+            &refusal,
+        );
+        assert!(
+            c.contains("https://auth.example.com/realms/people/account, then sign in again\""),
+            "{c}"
+        );
     }
 
     #[test]
