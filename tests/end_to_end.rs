@@ -760,6 +760,30 @@ async fn a_realm_token_that_is_not_a_valid_person_s_is_refused() {
     assert!(h.sts.exchanges().is_empty());
 }
 
+/// A person whose profile has no first or last name is told so, and where
+/// to add them, rather than which claims their token lacks.
+#[tokio::test]
+async fn a_person_without_a_name_is_told_to_complete_their_profile() {
+    let h = Harness::start(pvs).await;
+    let token = h.issuer.token_without_defaults(json!({
+        "iss": h.issuer.id(), "aud": [h.url.clone()], "sub": person_id("alice"),
+        "exp": now() + 300, "typ": "Bearer", "email": "a@example.com",
+        "email_verified": true, "name": "", "given_name": "",
+    }));
+    let response = h.post("", Some(&bearer(&token))).await;
+    assert_eq!(response.status(), 401);
+    let challenge = header(&response, "www-authenticate");
+    assert!(challenge.contains("error=\"invalid_token\""), "{challenge}");
+    assert!(
+        challenge.contains(
+            "your profile is incomplete, it has no first name (given_name), last name (family_name), name (name)"
+        ),
+        "{challenge}"
+    );
+    assert!(challenge.contains("then sign in again"), "{challenge}");
+    assert!(h.sts.exchanges().is_empty());
+}
+
 fn base64_url(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
